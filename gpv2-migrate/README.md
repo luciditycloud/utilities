@@ -17,18 +17,23 @@ same command and it picks up where it left off.
    `kind=BlobStorage`, across whichever subscriptions you point it at —
    pulling name, resource group, SKU, and current access tier in that same
    listing call, so nothing extra has to be looked up before upgrading.
-2. **Upgrades** each one, one at a time, via
-   `az storage account update --kind StorageV2`. This is a control-plane
+2. **Confirms** before touching anything real: it prints exactly which
+   accounts are about to be upgraded and asks `Proceed? [y/N]`. Skipped
+   automatically under `--dry-run` (nothing to confirm) or `--yes`
+   (for unattended/CI runs).
+3. **Upgrades** each one, one at a time, via
+   `az storage account update --set kind=StorageV2`. This is a control-plane
    change only — no data moves, no downtime, same endpoint and keys.
-3. If an upgrade **fails**, the script logs it, keeps going with the rest
+4. If an upgrade **fails**, the script logs it, keeps going with the rest
    of the batch, and at the end tells you how many accounts are upgraded
    vs. still remaining, and where to find the failure details.
-4. **Run it again** and it repeats step 1: it lists whatever is *still*
+5. **Run it again** and it repeats step 1: it lists whatever is *still*
    `kind=Storage`/`kind=BlobStorage` in Azure. Anything truly upgraded no
    longer matches that filter, so it's never touched twice. Anything that
    failed last time is still on the old kind, so it's retried
-   automatically — no special flag needed.
-5. Once a run finds **nothing left** to upgrade, it prints a final report:
+   automatically — no special flag needed (it'll ask for confirmation again
+   unless `--yes` is set).
+6. Once a run finds **nothing left** to upgrade, it prints a final report:
    every account it has ever touched, its original kind, and its current
    kind (re-checked live, not just trusted from memory).
 
@@ -51,6 +56,12 @@ in the final report — they're excluded on purpose, not silently dropped.
 
 ## Before you run it
 
+- Needs **bash 4.0+** (it uses associative arrays). macOS ships bash 3.2 as
+  `/bin/bash` by default — the script detects this and fails immediately
+  with a clear message rather than the cryptic errors an old bash would
+  otherwise produce. Install a newer one (`brew install bash`) and invoke
+  the script with its full path, e.g.
+  `/opt/homebrew/bin/bash gpv2_migrate.sh ...`.
 - The identity running the script needs **Contributor** (or a narrower
   custom role with `Microsoft.Storage/storageAccounts/write` and `.../read`)
   on every subscription you point it at.
@@ -68,9 +79,42 @@ in the final report — they're excluded on purpose, not silently dropped.
   export AZ_SP_TENANT="<tenant-id>"
   ```
 
+  Also pass `--yes` for unattended runs — without it, the confirmation
+  prompt (see above) will hang forever waiting for input that will never
+  come, since nothing is reading from stdin.
+
 - **The upgrade is irreversible.** There is no downgrade path from GPv2
   back to GPv1. Run with `--dry-run` against a non-production subscription
   first.
+
+## Execution
+
+Get the script and take it for a dry run first — this only lists and
+classifies accounts, it never changes anything:
+
+```bash
+wget https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/main/gpv2-migrate/gpv2_migrate.sh
+chmod +x gpv2_migrate.sh
+./gpv2_migrate.sh --dry-run
+```
+
+On macOS, invoke it with a bash 4+ binary instead of the system default
+(see *Before you run it* above — the script will otherwise refuse to run):
+
+```bash
+/opt/homebrew/bin/bash gpv2_migrate.sh --dry-run
+```
+
+Once the dry-run output looks right, drop `--dry-run` to make the real,
+irreversible change. The script will list exactly what it's about to
+upgrade and ask for confirmation before touching anything:
+
+```bash
+./gpv2_migrate.sh
+```
+
+See *Usage* below for scoping to specific subscriptions/resource groups,
+unattended/CI runs, and every other flag.
 
 ## Usage
 
@@ -78,7 +122,11 @@ in the final report — they're excluded on purpose, not silently dropped.
 chmod +x gpv2_migrate.sh
 
 # Default: every subscription you can see, tier=Hot, real changes.
+# (pauses for a y/N confirmation before making any change)
 ./gpv2_migrate.sh
+
+# Skip the confirmation prompt — for unattended/CI runs.
+./gpv2_migrate.sh --yes
 
 # Scope to specific subscriptions.
 ./gpv2_migrate.sh --subscriptions <sub-id-1>,<sub-id-2>
@@ -107,6 +155,7 @@ chmod +x gpv2_migrate.sh
 | `--state-file <path>` | `gpv2_migration_state.csv` | Where progress is tracked. |
 | `--log-file <path>` | `gpv2_migration.log` | Where every action and error is logged. |
 | `--dry-run` | off | List and classify accounts, but never call `az storage account update`. |
+| `-y`, `--yes` | off | Skip the `Proceed? [y/N]` confirmation prompt — required for unattended/CI runs, since nothing there can answer it. |
 | `-h`, `--help` | — | Show usage. |
 
 ## The files it creates
@@ -144,6 +193,14 @@ script did, including the full Azure CLI error text for any failure.
 
 ```
 [2026-09-02T06:21:41Z] Scanning subscription <sub> for GPv1 / legacy Blob Storage accounts...
+
+The following 3 account(s) will be upgraded to GPv2 — this is IRREVERSIBLE:
+  acct1                            rg=rg-prod                  sub=<sub> tier=Hot
+  acct2                            rg=rg-prod                  sub=<sub> tier=Hot
+  ...
+
+Re-run with --dry-run to preview only, or --yes to skip this prompt.
+Proceed? [y/N] y
 [2026-09-02T06:21:41Z] Upgrading acct1 (rg=rg-prod) -> StorageV2, tier=Hot ...
 [2026-09-02T06:21:41Z]   -> upgraded OK (acct1)
 [2026-09-02T06:21:41Z] Upgrading acct2 (rg=rg-prod) -> StorageV2, tier=Hot ...
@@ -162,6 +219,12 @@ Some accounts failed. Check gpv2_migration.log for details, then just run this e
 [2026-09-02T06:21:43Z] Loaded existing state: 5 account(s) previously tracked in gpv2_migration_state.csv.
 [2026-09-02T06:21:43Z] Scanning subscription <sub> for GPv1 / legacy Blob Storage accounts...
 [2026-09-02T06:21:43Z] Re-queuing previously-failed account for retry: acct2 (rg-prod)
+
+The following 1 account(s) will be upgraded to GPv2 — this is IRREVERSIBLE:
+  acct2                            rg=rg-prod                  sub=<sub> tier=Hot
+
+Re-run with --dry-run to preview only, or --yes to skip this prompt.
+Proceed? [y/N] y
 [2026-09-02T06:21:43Z] Upgrading acct2 (rg=rg-prod) -> StorageV2, tier=Hot ...
 [2026-09-02T06:21:43Z]   -> upgraded OK (acct2)
 
