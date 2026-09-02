@@ -298,7 +298,7 @@ upgrade_pending() {
     fi
 
     log "Upgrading $name (rg=$rg) -> StorageV2, tier=$tier ..."
-    if result=$(az storage account update --ids "$id" --set kind=StorageV2 --access-tier "$tier" \
+    if result=$(az storage account update --ids "$id" --set kind=StorageV2 --access-tier "$tier" --yes \
                   --query kind -o tsv 2>>"$LOG_FILE"); then
       if [[ "$result" == "StorageV2" ]]; then
         STATUS[$id]="upgraded"; ERRMSG[$id]=""; TS[$id]="$(now)"
