@@ -7,55 +7,6 @@ principal, and — depending on the mode you pick — optionally provisions the
 storage container and access-tracking setting Lucidity's inventory needs to
 read from.
 
-It's fully idempotent: re-running it with the same arguments updates the
-existing role/assignment in place rather than duplicating anything, and a
-`--clear` mode exists to cleanly remove everything it created.
-
-## What it actually does
-
-1. **Logs in** (if not already) and resolves Lucidity's service principal
-   (app id `4f2c2c1f-372a-4904-b13d-11e2467679f2`) in your tenant, creating
-   it if it doesn't exist yet.
-2. **Builds one custom role per scope you pass** — named
-   `<prefix>-mg-<mgId>` or `<prefix>-sub-<subId>` — containing:
-   - ~65 read-only control-plane actions across Compute, Networking,
-     Recovery Services (backup), Storage, Monitor/Log Analytics, Resource
-     Graph, AKS, Cost Management, and Authorization — everything Lucidity's
-     inventory needs to *look at*, nothing that lets it change anything
-     outside storage.
-   - One data-plane action, `blobs/read`, gated by an **ABAC condition**
-     that limits it to a single container named `lucidity-inventory` — so
-     even the one data-read permission granted can't see any other blob
-     data in the account.
-3. **Assigns** that role to Lucidity's service principal — always at
-   subscription scope. In MG mode, the role is homed at the management
-   group (so it lives/dies with that MG) but gets fanned out into a
-   separate assignment on every child subscription under it.
-4. **Provisions storage prerequisites**, depending on `-e` mode (see below):
-   Lucidity self-provisions, you provision now with this script using your
-   own credentials, or you provision it yourself later.
-5. **`--clear`** reverses all of it: finds every custom role starting with
-   the prefix at the scope(s) you give it, removes Lucidity's assignments
-   to each one, then deletes the role definition.
-
-Re-running the setup command is safe — existing roles are updated in place,
-and a prior assignment to the same role/scope is removed and recreated
-rather than duplicated.
-
-## The three enablement modes (`-e`)
-
-| Mode | Storage writes on the role? | Who provisions the container + LAT? |
-|---|---|---|
-| `lucidity_self` (default) | **Yes** — `containers/write` + `blobServices/write`, subscription-wide | Lucidity's SP does it itself, no extra step from you |
-| `setup_now` | No | **This script**, right now, using your own logged-in `az` credentials |
-| `customer_preprovision` | No | You, separately — the script prints the exact `az` commands to run |
-
-`lucidity_self` is the simplest (nothing else to do), but it's also the only
-mode where the SP holds subscription-wide storage-write permissions — the
-ABAC condition only restricts `blobs/read`, not those write actions. If you'd
-rather Lucidity hold no write permissions at all, use `setup_now` or
-`customer_preprovision` instead.
-
 ## Before you run it
 
 - Needs the **Azure CLI**, logged in (`az login`) as an identity with rights
@@ -183,6 +134,51 @@ Proceed? [y/N] y
  Status       : COMPLETE
 ==============================================================
 ```
+
+## What it actually does
+
+1. **Logs in** (if not already) and resolves Lucidity's service principal
+   (app id `4f2c2c1f-372a-4904-b13d-11e2467679f2`) in your tenant, creating
+   it if it doesn't exist yet.
+2. **Builds one custom role per scope you pass** — named
+   `<prefix>-mg-<mgId>` or `<prefix>-sub-<subId>` — containing:
+   - ~65 read-only control-plane actions across Compute, Networking,
+     Recovery Services (backup), Storage, Monitor/Log Analytics, Resource
+     Graph, AKS, Cost Management, and Authorization — everything Lucidity's
+     inventory needs to *look at*, nothing that lets it change anything
+     outside storage.
+   - One data-plane action, `blobs/read`, gated by an **ABAC condition**
+     that limits it to a single container named `lucidity-inventory` — so
+     even the one data-read permission granted can't see any other blob
+     data in the account.
+3. **Assigns** that role to Lucidity's service principal — always at
+   subscription scope. In MG mode, the role is homed at the management
+   group (so it lives/dies with that MG) but gets fanned out into a
+   separate assignment on every child subscription under it.
+4. **Provisions storage prerequisites**, depending on `-e` mode (see below):
+   Lucidity self-provisions, you provision now with this script using your
+   own credentials, or you provision it yourself later.
+5. **`--clear`** reverses all of it: finds every custom role starting with
+   the prefix at the scope(s) you give it, removes Lucidity's assignments
+   to each one, then deletes the role definition.
+
+Re-running the setup command is safe — existing roles are updated in place,
+and a prior assignment to the same role/scope is removed and recreated
+rather than duplicated.
+
+## The three enablement modes (`-e`)
+
+| Mode | Storage writes on the role? | Who provisions the container + LAT? |
+|---|---|---|
+| `lucidity_self` (default) | **Yes** — `containers/write` + `blobServices/write`, subscription-wide | Lucidity's SP does it itself, no extra step from you |
+| `setup_now` | No | **This script**, right now, using your own logged-in `az` credentials |
+| `customer_preprovision` | No | You, separately — the script prints the exact `az` commands to run |
+
+`lucidity_self` is the simplest (nothing else to do), but it's also the only
+mode where the SP holds subscription-wide storage-write permissions — the
+ABAC condition only restricts `blobs/read`, not those write actions. If you'd
+rather Lucidity hold no write permissions at all, use `setup_now` or
+`customer_preprovision` instead.
 
 ## Troubleshooting
 
