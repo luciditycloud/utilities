@@ -1,0 +1,12 @@
+# Storage accounts where Lucidity enabled last-access-time (LAT) tracking.
+# One account name per line — the script resolves each one's subscription
+# automatically via Azure Resource Graph, so subscription names are not
+
+storageaccount1
+storageaccount2
+storageaccount3
+storageaccount4
+storageaccount5
+storageaccount6
+storageaccount7
+
