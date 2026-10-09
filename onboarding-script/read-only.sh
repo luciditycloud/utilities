@@ -1,41 +1,21 @@
-#!/bin/bash
-# =============================================================================
-# Lucidity - PERMISSIONS_READONLY setup (per-scope roles)
-# -----------------------------------------------------------------------------
-# ONE custom role PER SCOPE, so a role is always welded to a single scope and
-# can be managed/deleted from that scope (no cross-scope collisions):
-#
-#   -m "<mgIds>"    -> per MG:  <prefix>-mg-<mgId>   homed at that MG,
-#                      assigned at the MG scope (inherited by all child subs).
-#   -s "<subIds>"   -> per sub: <prefix>-sub-<subId> homed at that sub,
-#                      assigned at that subscription scope.
-#   IDs may be comma- or space-separated. Exactly one of -m / -s.
-#
-# ENABLEMENT_MODE (-e) decides WHO provisions 'lucidity-inventory' + LAT, and
-# therefore whether the role carries storage writes:
-#   lucidity_self          role KEEPS containers/write + blobServices/write; SP self-provisions.
-#   setup_now  (tightest)  role has NO storage writes; THIS run provisions with YOUR creds.
-#   customer_preprovision  role has NO storage writes; you provision separately.
-#
-# --clear (-c) with -m/-s : deletes every custom role whose name starts with the
-#   prefix at the given scope(s), first removing Lucidity's assignments to them.
-#   Prefix defaults to ROLE_PREFIX; override with -p.
-#
-# ABAC: a v2.0 condition limits blob DATA read (blobs/read) to 'lucidity-inventory'.
-#   NOTE: at MG scope the condition is enforced but NOT viewable/editable in the
-#   Azure portal (CLI only): az role assignment list --scope <mg> --query "[].condition".
-#   Container CREATION is a control-plane action and is never ABAC-name-restrictable.
-#
-# Flags: -m -s | -e <mode> | -a "<accts>" (setup_now) | -p <prefix> | -c/--clear | -y | -h
-# Requires: az CLI (logged in), bash. No jq/python dependency.
-# =============================================================================
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# ---- Config ----------------------------------------------------------------
-LUCIDITYAPPID="4f2c2c1f-372a-4904-b13d-11e2467679f2"
-ROLE_PREFIX="lucidity-permissions-readonly"
-INVENTORY_CONTAINER="lucidity-inventory"
-ENABLEMENT_MODE="lucidity_self"
-LUCIDITY_READ_CONDITION="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'})) OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals '${INVENTORY_CONTAINER}'))"
+# Lucidity Azure read-only onboarding (management-group workflow).
+# Default is plan-only. Add --execute to make changes.
+# Requires Azure Cloud Shell Bash, Azure CLI and jq.
+
+SCRIPT_VERSION="2.2.0"
+APP_ID="4f2c2c1f-372a-4904-b13d-11e2467679f2"
+ROLE_NAME="LUCIDITY_PLATFORM"
+CONTAINER="lucidity-inventory"
+LUCIDITY_BLOB_EGRESS_IP="4.157.111.90"
+LUCIDITY_BACKEND_SUBNET="/subscriptions/3511ac94-c2ef-4644-8147-55f5f9a27a9e/resourceGroups/azurepls-rg/providers/Microsoft.Network/virtualNetworks/azurepls-vnet/subnets/aks-subnet"
+MG_ID=""
+SUBSCRIPTION_ID=""
+NETWORK_MODE=""
+EXECUTE="false"
+ASSUME_YES="false"
 
 ACTIONS=(
   "Microsoft.Compute/availabilitySets/read"
@@ -108,281 +88,500 @@ ACTIONS=(
   "Microsoft.Authorization/roleAssignments/read"
   "Microsoft.Authorization/roleDefinitions/read"
 )
-DATA_ACTIONS=( "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read" )
-ENABLEMENT_WRITES=(
-  "Microsoft.Storage/storageAccounts/blobServices/containers/write"
-  "Microsoft.Storage/storageAccounts/blobServices/write"
-)
+DATA_ACTIONS=("Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read")
 
-# ---- Long-opt translation --------------------------------------------------
-args=()
-for a in "$@"; do
-  case "$a" in
-    --clear) args+=("-c") ;;
-    --yes)   args+=("-y") ;;
-    --help)  args+=("-h") ;;
-    *)       args+=("$a") ;;
-  esac
-done
-set -- "${args[@]}"
-
-# ---- Arg parsing -----------------------------------------------------------
-MG_INPUT=""; SUB_INPUT=""; ACCT_INPUT=""; ASSUME_YES="false"; MODE_INPUT=""; PREFIX_INPUT=""; DO_CLEAR="false"
 usage() {
-  echo "Usage:"
-  echo "  Setup : $0 (-m \"<mgIds>\" | -s \"<subIds>\") [-e <mode>] [-a \"<accts>\"] [-y]"
-  echo "  Clear : $0 --clear (-m \"<mgIds>\" | -s \"<subIds>\") [-p <prefix>] [-y]"
-  echo "  -m  management group ids (per-MG role, assigned at MG scope)"
-  echo "  -s  subscription ids     (per-sub role, assigned at sub scope)"
-  echo "  -e  mode: lucidity_self | setup_now | customer_preprovision (default: ${ENABLEMENT_MODE})"
-  echo "  -a  (setup_now) limit provisioning to these storage accounts"
-  echo "  -p  role-name prefix (default: ${ROLE_PREFIX})"
-  echo "  -c, --clear   delete all roles with the prefix at the given scope(s)"
-  echo "  -y, --yes     skip confirmation"
-  echo "  IDs may be comma- or space-separated. Provide exactly one of -m / -s."
-  exit 1
+  cat <<'EOF'
+Usage:
+  ./read-only.sh --management-group <MG_ID> [--subscription <SUB_ID>] [--execute] [--yes]
+  ./read-only.sh --management-group <MG_ID> [--subscription <SUB_ID>] --network-audit
+  ./read-only.sh --management-group <MG_ID> [--subscription <SUB_ID>] --network-config [--execute] [--yes]
+
+Options:
+  -m, --management-group <id>  Target management group (required)
+  -s, --subscription <id>      Pilot one child subscription only
+  -r, --role-name <name>       Custom role name (default: LUCIDITY_PLATFORM)
+  -a, --app-id <app-id>        Lucidity application ID
+      --network-audit          Audit Blob network rules; never makes changes
+      --network-config         Preview/add required Blob network rules
+      --execute                Apply the plan; otherwise make no changes
+  -y, --yes                    Skip confirmation in execute mode
+      --version                Show script version
+  -h, --help                   Show help
+EOF
 }
-while getopts ":m:s:a:e:p:cyh" opt; do
-  case "$opt" in
-    m) MG_INPUT="$OPTARG" ;;
-    s) SUB_INPUT="$OPTARG" ;;
-    a) ACCT_INPUT="$OPTARG" ;;
-    e) MODE_INPUT="$OPTARG" ;;
-    p) PREFIX_INPUT="$OPTARG" ;;
-    c) DO_CLEAR="true" ;;
-    y) ASSUME_YES="true" ;;
-    h) usage ;;
-    *) usage ;;
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--management-group) MG_ID="${2:-}"; shift 2 ;;
+    -s|--subscription) SUBSCRIPTION_ID="${2:-}"; shift 2 ;;
+    -r|--role-name) ROLE_NAME="${2:-}"; shift 2 ;;
+    -a|--app-id) APP_ID="${2:-}"; shift 2 ;;
+    --network-audit)
+      [[ -z "$NETWORK_MODE" ]] || die "Use only one network mode."
+      NETWORK_MODE="audit"; shift ;;
+    --network-config)
+      [[ -z "$NETWORK_MODE" ]] || die "Use only one network mode."
+      NETWORK_MODE="config"; shift ;;
+    --execute) EXECUTE="true"; shift ;;
+    -y|--yes) ASSUME_YES="true"; shift ;;
+    --version) echo "read-only.sh ${SCRIPT_VERSION}"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown argument: $1" ;;
   esac
 done
 
-[ -n "$MODE_INPUT" ]   && ENABLEMENT_MODE="$MODE_INPUT"
-[ -n "$PREFIX_INPUT" ] && ROLE_PREFIX="$PREFIX_INPUT"
+[[ -n "$MG_ID" ]] || { usage; die "--management-group is required"; }
+[[ "$NETWORK_MODE" != "audit" || "$EXECUTE" != "true" ]] ||
+  die "--network-audit is always read-only; remove --execute."
+need az
+need jq
 
-case "$ENABLEMENT_MODE" in lucidity_self|setup_now|customer_preprovision) ;; *) echo "ERROR: -e must be lucidity_self | setup_now | customer_preprovision. Got: '${ENABLEMENT_MODE}'"; exit 1 ;; esac
-if { [ -n "$MG_INPUT" ] && [ -n "$SUB_INPUT" ]; } || { [ -z "$MG_INPUT" ] && [ -z "$SUB_INPUT" ]; }; then
-  echo "ERROR: provide exactly one of -m or -s."; usage
-fi
+MG_SCOPE="/providers/Microsoft.Management/managementGroups/${MG_ID}"
+CONDITION="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'})) OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals '${CONTAINER}'))"
+DESCRIPTION="Lucidity assessment role with discovery reads, Run Command collection and limited storage enablement actions. Blob data read is limited to '${CONTAINER}' by each subscription assignment."
+ACTIONS_JSON="$(printf '%s\n' "${ACTIONS[@]}" | jq -R . | jq -s 'unique')"
+DATA_ACTIONS_JSON="$(printf '%s\n' "${DATA_ACTIONS[@]}" | jq -R . | jq -s 'unique')"
 
-normalize() { echo "$1" | tr ',' ' ' | xargs; }
-MODE=""; SCOPE_LIST=()
-if [ -n "$MG_INPUT" ]; then MODE="mg"; read -ra SCOPE_LIST <<< "$(normalize "$MG_INPUT")"
-else MODE="sub"; read -ra SCOPE_LIST <<< "$(normalize "$SUB_INPUT")"; fi
-ACCT_FILTER="$(normalize "$ACCT_INPUT")"
+az account show >/dev/null 2>&1 || die "Azure CLI is not logged in. Open Cloud Shell or run: az login"
+TENANT_ID="$(az account show --query tenantId -o tsv --only-show-errors)"
+SIGNED_IN_AS="$(az account show --query user.name -o tsv --only-show-errors)"
+az account management-group show --name "$MG_ID" --only-show-errors >/dev/null ||
+  die "Cannot read management group '$MG_ID'. Check the ID and your access."
 
-# ---- Drop storage writes unless SP self-provisions -------------------------
-if [ "$ENABLEMENT_MODE" != "lucidity_self" ]; then
-  tmp=(); for a in "${ACTIONS[@]}"; do
-    skip=0; for w in "${ENABLEMENT_WRITES[@]}"; do [ "$a" = "$w" ] && skip=1 && break; done
-    [ "$skip" -eq 0 ] && tmp+=("$a")
-  done; ACTIONS=("${tmp[@]}")
-fi
+mapfile -t ALL_SUBSCRIPTIONS < <(
+  az account management-group entities list --only-show-errors \
+    --query "[?type=='/subscriptions' && contains(parentNameChain, '${MG_ID}')].name" -o tsv | sort -u
+)
+[[ "${#ALL_SUBSCRIPTIONS[@]}" -gt 0 ]] ||
+  die "No child subscriptions found. Check management-group Reader access."
 
-# ---- Helpers ---------------------------------------------------------------
-json_array() { local first=1 out="["; for x in "$@"; do [ $first -eq 1 ] && first=0 || out="${out},"; out="${out}\"${x}\""; done; printf '%s]' "$out"; }
-
-scope_path() {  # $1=mg|sub  $2=id
-  if [ "$1" = "mg" ]; then echo "/providers/Microsoft.Management/managementGroups/$2"; else echo "/subscriptions/$2"; fi
-}
-role_name_for() { echo "${ROLE_PREFIX}-$1-$2"; }   # $1=mg|sub $2=id
-
-resolve_sp() {
-  servicePrincipalId=$(az ad sp create --id "$LUCIDITYAPPID" --query id -o tsv --only-show-errors 2>/dev/null)
-  [ -z "$servicePrincipalId" ] && servicePrincipalId=$(az ad sp list --all --query "[?appId=='${LUCIDITYAPPID}'].id" -o tsv --only-show-errors)
-  [ -z "$servicePrincipalId" ] && { echo "ERROR: could not resolve Lucidity SP. Contact Lucidity."; exit 1; }
-}
-
-create_or_update_role() {  # $1=roleName $2=scopePath ; echoes roleId on stdout, "" on failure (diagnostics to stderr)
-  local rname="$1" scope="$2" rfile rid rerr existing
-  rfile="$(mktemp)"
-  cat > "$rfile" <<EOF
-{
-  "Name": "${rname}",
-  "IsCustom": true,
-  "Description": "Lucidity read-only assessment role (mode: ${ENABLEMENT_MODE}). Blob DATA read limited to '${INVENTORY_CONTAINER}' via ABAC on the assignment.",
-  "Actions": $(json_array "${ACTIONS[@]}"),
-  "NotActions": [],
-  "DataActions": $(json_array "${DATA_ACTIONS[@]}"),
-  "NotDataActions": [],
-  "AssignableScopes": $(json_array "$scope")
-}
-EOF
-  existing=$(az role definition list --name "$rname" --scope "$scope" --query "[0].name" -o tsv --only-show-errors 2>/dev/null)
-  if [ -z "$existing" ]; then
-    rid=$(az role definition create --role-definition "$rfile" --query name -o tsv 2>/tmp/.lucidity_re); [ -z "$rid" ] && {
-      echo "     create failed: $(tr '\n' ' ' </tmp/.lucidity_re | sed 's/  */ /g')" >&2
-      rid=$(az role definition update --role-definition "$rfile" --query name -o tsv 2>/tmp/.lucidity_re)
-      [ -z "$rid" ] && echo "     update also failed: $(tr '\n' ' ' </tmp/.lucidity_re | sed 's/  */ /g')" >&2
-    }
-  else
-    rid=$(az role definition update --role-definition "$rfile" --query name -o tsv 2>/tmp/.lucidity_re)
-    [ -z "$rid" ] && { echo "     update failed: $(tr '\n' ' ' </tmp/.lucidity_re | sed 's/  */ /g')" >&2; rid="$existing"; }
-  fi
-  rm -f "$rfile" /tmp/.lucidity_re
-  if [ -z "$rid" ]; then
-    for _ in 1 2 3 4 5 6; do rid=$(az role definition list --name "$rname" --scope "$scope" --query "[0].name" -o tsv --only-show-errors 2>/dev/null); [ -n "$rid" ] && break; sleep 5; done
-  fi
-  echo "$rid"
-}
-
-assign_role() {  # $1=roleId $2=scope ; returns 0 ok / 1 fail
-  local rid="$1" scope="$2" prior out lasterr
-  prior=$(az role assignment list --assignee "$servicePrincipalId" --role "$rid" --scope "$scope" --query "[0].id" -o tsv --only-show-errors 2>/dev/null)
-  [ -n "$prior" ] && { az role assignment delete --ids "$prior" --only-show-errors >/dev/null 2>&1; echo "       removed prior assignment"; }
-  for _ in 1 2 3 4 5 6; do
-    out=$(az role assignment create --assignee-object-id "$servicePrincipalId" --assignee-principal-type ServicePrincipal \
-          --role "$rid" --scope "$scope" --condition "$LUCIDITY_READ_CONDITION" --condition-version "2.0" \
-          --query name -o tsv 2>&1)
-    if [ $? -eq 0 ] && [ -n "$out" ]; then echo "       assigned (ABAC read-condition applied)"; return 0; fi
-    lasterr="$out"; sleep 5
+SELECTION_MODE="ALL CHILD SUBSCRIPTIONS"
+if [[ -n "$SUBSCRIPTION_ID" ]]; then
+  MATCHED_SUBSCRIPTION=""
+  for CHILD_SUBSCRIPTION in "${ALL_SUBSCRIPTIONS[@]}"; do
+    if [[ "${CHILD_SUBSCRIPTION,,}" == "${SUBSCRIPTION_ID,,}" ]]; then
+      MATCHED_SUBSCRIPTION="$CHILD_SUBSCRIPTION"
+      break
+    fi
   done
-  echo "       ASSIGNMENT FAILED: $(echo "$lasterr" | tr '\n' ' ' | sed 's/  */ /g')"
-  return 1
-}
+  [[ -n "$MATCHED_SUBSCRIPTION" ]] ||
+    die "Subscription '$SUBSCRIPTION_ID' is not beneath management group '$MG_ID'. No changes made."
+  SUBSCRIPTIONS=("$MATCHED_SUBSCRIPTION")
+  SELECTION_MODE="SINGLE-SUBSCRIPTION PILOT"
+else
+  SUBSCRIPTIONS=("${ALL_SUBSCRIPTIONS[@]}")
+fi
 
-provision_sub() {  # $1=subId ; provisions container + LAT (operator creds). returns 0/1
-  local sub="$1" accounts line acct rg exists lat rc=0
-  az account set --subscription "$sub" --only-show-errors 2>/dev/null || { echo "     ($sub) WARN: cannot select subscription"; return 1; }
-  if [ -n "$ACCT_FILTER" ]; then
-    accounts=""
-    for a in $ACCT_FILTER; do
-      rg=$(az storage account list --query "[?name=='$a'].resourceGroup | [0]" -o tsv --only-show-errors 2>/dev/null)
-      [ -n "$rg" ] && accounts="${accounts}${a}:::${rg}"$'\n'
+if [[ -n "$NETWORK_MODE" ]]; then
+  echo "=============================================================="
+  echo "Lucidity Blob network $([[ "$NETWORK_MODE" == "audit" ]] && echo audit || echo configuration)"
+  echo "  Script version        : $SCRIPT_VERSION"
+  echo "  Tenant               : $TENANT_ID"
+  echo "  Signed in as          : $SIGNED_IN_AS"
+  echo "  Management group     : $MG_ID"
+  echo "  Selection mode       : $SELECTION_MODE"
+  echo "  Selected subscriptions: ${#SUBSCRIPTIONS[@]}"
+  echo "  Lucidity collector IP: $LUCIDITY_BLOB_EGRESS_IP"
+  echo "  Lucidity subnet      : $LUCIDITY_BACKEND_SUBNET"
+  echo "  Mode                 : $([[ "$NETWORK_MODE" == "audit" ]] && echo READ-ONLY || { [[ "$EXECUTE" == "true" ]] && echo EXECUTE || echo PLAN-ONLY; })"
+  echo "=============================================================="
+
+  SCANNED=0; COMPLIANT=0; REQUIRED=0; MANUAL=0; INSPECTION_FAILED=0
+  NETWORK_TARGETS=()
+
+  for SUB_ID in "${SUBSCRIPTIONS[@]}"; do
+    echo ">> Discovering storage accounts in subscription: $SUB_ID"
+    if ! ACCOUNTS_JSON="$(az storage account list --subscription "$SUB_ID" -o json --only-show-errors 2>/dev/null)"; then
+      echo "   FAILED to list storage accounts."
+      INSPECTION_FAILED=$((INSPECTION_FAILED + 1))
+      continue
+    fi
+
+    mapfile -t STORAGE_ACCOUNTS < <(jq -r '.[] | [.name, .resourceGroup] | @tsv' <<<"$ACCOUNTS_JSON")
+    if [[ "${#STORAGE_ACCOUNTS[@]}" -eq 0 ]]; then
+      echo "   No storage accounts found."
+      continue
+    fi
+
+    for ACCOUNT_ROW in "${STORAGE_ACCOUNTS[@]}"; do
+      IFS=$'\t' read -r STORAGE_ACCOUNT RESOURCE_GROUP <<<"$ACCOUNT_ROW"
+      SCANNED=$((SCANNED + 1))
+
+      if ! ACCOUNT_JSON="$(az storage account show \
+        --subscription "$SUB_ID" --resource-group "$RESOURCE_GROUP" \
+        --name "$STORAGE_ACCOUNT" -o json --only-show-errors 2>/dev/null)"; then
+        echo "   [$STORAGE_ACCOUNT] INSPECTION FAILED"
+        INSPECTION_FAILED=$((INSPECTION_FAILED + 1))
+        continue
+      fi
+
+      PUBLIC_ACCESS="$(jq -r '.publicNetworkAccess // "Enabled"' <<<"$ACCOUNT_JSON")"
+      DEFAULT_ACTION="$(jq -r '.networkRuleSet.defaultAction // "Allow"' <<<"$ACCOUNT_JSON")"
+      PRIVATE_ENDPOINTS="$(jq '[.privateEndpointConnections[]? | select((.properties.privateLinkServiceConnectionState.status // "") == "Approved")] | length' <<<"$ACCOUNT_JSON")"
+      IP_PRESENT="$(jq -r --arg ip "$LUCIDITY_BLOB_EGRESS_IP" \
+        'any(.networkRuleSet.ipRules[]?; (.ipAddressOrRange // .value // "") == $ip)' <<<"$ACCOUNT_JSON")"
+      SUBNET_PRESENT="$(jq -r --arg subnet "${LUCIDITY_BACKEND_SUBNET,,}" \
+        'any(.networkRuleSet.virtualNetworkRules[]?; ((.virtualNetworkResourceId // .id // "") | ascii_downcase) == $subnet)' <<<"$ACCOUNT_JSON")"
+
+      IP_STATUS="$([[ "$IP_PRESENT" == "true" ]] && echo PRESENT || echo MISSING)"
+      SUBNET_STATUS="$([[ "$SUBNET_PRESENT" == "true" ]] && echo PRESENT || echo MISSING)"
+
+      if [[ "${PUBLIC_ACCESS,,}" == "disabled" ]]; then
+        RESULT="MANUAL REVIEW - public network access is disabled"
+        MANUAL=$((MANUAL + 1))
+      elif [[ "$IP_PRESENT" == "true" && "$SUBNET_PRESENT" == "true" ]]; then
+        RESULT="COMPLIANT"
+        COMPLIANT=$((COMPLIANT + 1))
+      else
+        RESULT="CONFIGURATION REQUIRED"
+        REQUIRED=$((REQUIRED + 1))
+        [[ "$NETWORK_MODE" == "config" ]] &&
+          NETWORK_TARGETS+=("${SUB_ID}|${RESOURCE_GROUP}|${STORAGE_ACCOUNT}|${IP_PRESENT}|${SUBNET_PRESENT}")
+      fi
+
+      echo "   [$STORAGE_ACCOUNT] $RESULT"
+      echo "      Resource group : $RESOURCE_GROUP"
+      echo "      Public access  : $PUBLIC_ACCESS"
+      echo "      Default action : $DEFAULT_ACTION"
+      echo "      Private endpoints: $PRIVATE_ENDPOINTS"
+      echo "      Lucidity IP    : $IP_STATUS"
+      echo "      Lucidity subnet: $SUBNET_STATUS"
     done
-  else
-    accounts=$(az storage account list --query "[].[name,resourceGroup]" -o tsv --only-show-errors 2>/dev/null | sed 's/\t/:::/')
+  done
+
+  echo "=============================================================="
+  echo "Blob network assessment summary"
+  echo "  Subscriptions selected : ${#SUBSCRIPTIONS[@]}"
+  echo "  Storage accounts scanned: $SCANNED"
+  echo "  Compliant              : $COMPLIANT"
+  echo "  Configuration required : $REQUIRED"
+  echo "  Manual review          : $MANUAL"
+  echo "  Inspection failures    : $INSPECTION_FAILED"
+  echo "=============================================================="
+
+  if [[ "$NETWORK_MODE" == "audit" ]]; then
+    echo "No changes made. --network-audit is always read-only."
+    [[ "$INSPECTION_FAILED" -eq 0 ]] || exit 1
+    exit 0
   fi
-  [ -z "$accounts" ] && { echo "     ($sub) no storage accounts in scope"; return 0; }
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    acct="${line%%:::*}"; rg="${line##*:::}"
-    exists=$(az storage container-rm exists -g "$rg" --storage-account "$acct" -n "$INVENTORY_CONTAINER" --query exists -o tsv --only-show-errors 2>/dev/null)
-    if [ "$exists" = "true" ]; then echo "     ($sub) $acct: container OK"
-    else az storage container-rm create -g "$rg" --storage-account "$acct" -n "$INVENTORY_CONTAINER" --only-show-errors >/dev/null 2>&1 \
-         && echo "     ($sub) $acct: container created" || { echo "     ($sub) $acct: container create FAILED"; rc=1; }; fi
-    lat=$(az storage account blob-service-properties show -g "$rg" -n "$acct" --query "lastAccessTimeTrackingPolicy.enable" -o tsv --only-show-errors 2>/dev/null)
-    if [ "$lat" = "true" ]; then echo "     ($sub) $acct: LAT OK"
-    else az storage account blob-service-properties update -g "$rg" -n "$acct" --enable-last-access-tracking true --only-show-errors >/dev/null 2>&1 \
-         && echo "     ($sub) $acct: LAT enabled" || { echo "     ($sub) $acct: LAT enable FAILED"; rc=1; }; fi
-  done <<< "$accounts"
-  return $rc
-}
 
-subs_under_mg() {  # $1=mgId ; prints child subscription ids (nested included)
-  az account management-group entities list \
-    --query "[?type=='/subscriptions' && contains(parentNameChain, '$1')].name" -o tsv --only-show-errors 2>/dev/null
-}
+  if [[ "${#NETWORK_TARGETS[@]}" -eq 0 ]]; then
+    echo "No eligible storage-account network changes are required."
+    [[ "$INSPECTION_FAILED" -eq 0 ]] || exit 1
+    exit 0
+  fi
 
-clear_scope() {  # $1=scopePath ; deletes prefix-matching custom roles + their Lucidity assignments
-  local scope="$1" line rname rid asg delerr n=0
-  echo "   scope: $scope  (prefix '${ROLE_PREFIX}')"
-  # list custom roles at this scope whose name starts with prefix
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    rname="${line%%:::*}"; rid="${line##*:::}"
-    n=$((n+1))
-    echo "     - ${rname}"
-    # remove Lucidity SP assignments to this role, wherever they are
-    for asg in $(az role assignment list --all --assignee "$servicePrincipalId" --role "$rid" --query "[].id" -o tsv --only-show-errors 2>/dev/null); do
-      az role assignment delete --ids "$asg" --only-show-errors >/dev/null 2>&1 && echo "         removed assignment"
-    done
-    delerr=$(az role definition delete --name "$rid" --scope "$scope" 2>&1)
-    if [ $? -eq 0 ]; then echo "         deleted role definition"
-    else echo "         DELETE FAILED: $(echo "$delerr" | tr '\n' ' ' | sed 's/  */ /g')"; fi
-  done < <(az role definition list --scope "$scope" --custom-role-only true \
-            --query "[?starts_with(roleName, '${ROLE_PREFIX}')].[roleName,name]" -o tsv --only-show-errors 2>/dev/null | sed 's/\t/:::/')
-  [ "$n" -eq 0 ] && echo "     (no matching roles found at this scope)"
-}
+  echo
+  echo "Proposed changes for ${#NETWORK_TARGETS[@]} storage account(s):"
+  for TARGET in "${NETWORK_TARGETS[@]}"; do
+    IFS='|' read -r TARGET_SUB TARGET_RG TARGET_ACCOUNT TARGET_IP_PRESENT TARGET_SUBNET_PRESENT <<<"$TARGET"
+    echo "  - $TARGET_ACCOUNT ($TARGET_SUB / $TARGET_RG)"
+    [[ "$TARGET_IP_PRESENT" == "true" ]] || echo "      add IP rule: $LUCIDITY_BLOB_EGRESS_IP"
+    [[ "$TARGET_SUBNET_PRESENT" == "true" ]] || echo "      add subnet rule: $LUCIDITY_BACKEND_SUBNET"
+  done
 
-# ---- Login + SP ------------------------------------------------------------
-echo ">> Ensuring Azure CLI login..."
-az account show >/dev/null 2>&1 || az login --only-show-errors >/dev/null
-tenantId=$(az account show --query tenantId -o tsv --only-show-errors)
-echo ">> Resolving Lucidity service principal..."
-resolve_sp
-echo "   Service Principal Id: $servicePrincipalId"
+  if [[ "$EXECUTE" != "true" ]]; then
+    echo
+    echo "No changes made. Review the plan, then rerun with --network-config --execute."
+    exit 0
+  fi
 
-# ---- CLEAR mode ------------------------------------------------------------
-if [ "$DO_CLEAR" = "true" ]; then
-  echo ""
+  if [[ "$ASSUME_YES" != "true" ]]; then
+    read -r -p "Apply these storage-account network rules? [y/N] " REPLY
+    [[ "$REPLY" =~ ^([yY]|[yY][eE][sS])$ ]] || { echo "Aborted."; exit 0; }
+  fi
+
+  UPDATED=0; CONFIG_FAILED=0
+  for TARGET in "${NETWORK_TARGETS[@]}"; do
+    IFS='|' read -r TARGET_SUB TARGET_RG TARGET_ACCOUNT TARGET_IP_PRESENT TARGET_SUBNET_PRESENT <<<"$TARGET"
+    echo ">> Configuring storage account: $TARGET_ACCOUNT"
+    ACCOUNT_FAILED="false"
+
+    if [[ "$TARGET_IP_PRESENT" != "true" ]]; then
+      echo "   Adding Lucidity Blob collector IP rule..."
+      if ! az storage account network-rule add \
+        --subscription "$TARGET_SUB" --resource-group "$TARGET_RG" \
+        --account-name "$TARGET_ACCOUNT" --ip-address "$LUCIDITY_BLOB_EGRESS_IP" \
+        --only-show-errors >/dev/null; then
+        echo "   FAILED to add the IP rule."
+        ACCOUNT_FAILED="true"
+      fi
+    fi
+
+    if [[ "$TARGET_SUBNET_PRESENT" != "true" ]]; then
+      echo "   Adding Lucidity backend subnet rule..."
+      if ! az storage account network-rule add \
+        --subscription "$TARGET_SUB" --resource-group "$TARGET_RG" \
+        --account-name "$TARGET_ACCOUNT" --subnet "$LUCIDITY_BACKEND_SUBNET" \
+        --only-show-errors >/dev/null; then
+        echo "   FAILED to add the subnet rule."
+        ACCOUNT_FAILED="true"
+      fi
+    fi
+
+    if [[ "$ACCOUNT_FAILED" == "false" ]]; then
+      if VERIFY_JSON="$(az storage account show \
+        --subscription "$TARGET_SUB" --resource-group "$TARGET_RG" \
+        --name "$TARGET_ACCOUNT" -o json --only-show-errors 2>/dev/null)"; then
+        VERIFY_IP="$(jq -r --arg ip "$LUCIDITY_BLOB_EGRESS_IP" \
+          'any(.networkRuleSet.ipRules[]?; (.ipAddressOrRange // .value // "") == $ip)' <<<"$VERIFY_JSON")"
+        VERIFY_SUBNET="$(jq -r --arg subnet "${LUCIDITY_BACKEND_SUBNET,,}" \
+          'any(.networkRuleSet.virtualNetworkRules[]?; ((.virtualNetworkResourceId // .id // "") | ascii_downcase) == $subnet)' <<<"$VERIFY_JSON")"
+        if [[ "$VERIFY_IP" == "true" && "$VERIFY_SUBNET" == "true" ]]; then
+          echo "   VERIFIED - both Lucidity network rules are present."
+          UPDATED=$((UPDATED + 1))
+        else
+          echo "   FAILED verification after the update."
+          CONFIG_FAILED=$((CONFIG_FAILED + 1))
+        fi
+      else
+        echo "   FAILED to verify the storage account after the update."
+        CONFIG_FAILED=$((CONFIG_FAILED + 1))
+      fi
+    else
+      CONFIG_FAILED=$((CONFIG_FAILED + 1))
+    fi
+  done
+
   echo "=============================================================="
-  echo " CLEAR - delete custom roles with prefix '${ROLE_PREFIX}'"
-  echo "   Scope mode : ${MODE}   targets: ${SCOPE_LIST[*]}"
-  echo "   Also removes Lucidity SP (${servicePrincipalId}) assignments to them"
+  echo "Blob network configuration summary"
+  echo "  Storage accounts targeted: ${#NETWORK_TARGETS[@]}"
+  echo "  Updated and verified      : $UPDATED"
+  echo "  Manual review             : $MANUAL"
+  echo "  Failed                    : $CONFIG_FAILED"
   echo "=============================================================="
-  if [ "$ASSUME_YES" != "true" ]; then printf "Proceed with deletion? [y/N] "; read -r r; case "$r" in y|Y|yes|YES) ;; *) echo "Aborted."; exit 0 ;; esac; fi
-  for id in "${SCOPE_LIST[@]}"; do clear_scope "$(scope_path "$MODE" "$id")"; done
-  echo ">> Clear complete."
+  [[ "$CONFIG_FAILED" -eq 0 ]] || exit 1
   exit 0
 fi
 
-# ---- Consequence banner + confirm ------------------------------------------
-echo ""
-echo "=============================================================="
-echo " About to apply (mode: ${ENABLEMENT_MODE})"
-echo "   Scope mode  : ${MODE}   targets: ${SCOPE_LIST[*]}"
-echo "   Roles       : one per ${MODE} -> ${ROLE_PREFIX}-${MODE}-<id> (${#ACTIONS[@]} actions each)"
-echo "   Assigned to : Lucidity SP ${servicePrincipalId} (always at SUBSCRIPTION scope)"
-echo "   ABAC gate   : blobs/read -> container '${INVENTORY_CONTAINER}'"
-[ "$MODE" = "mg" ] && echo "                 (MG mode: role homed at the MG; assignments fan out to each child subscription)"
-case "$ENABLEMENT_MODE" in
-  lucidity_self) echo "   Storage wr. : YES to SP (containers/write + blobServices/write, subscription-wide)"; echo "   Provisions  : nothing (SP self-enables container + LAT)";;
-  setup_now) echo "   Storage wr. : NONE to SP"; if [ -n "$ACCT_FILTER" ]; then echo "   Provisions  : container + LAT on accounts [${ACCT_FILTER}] using YOUR creds"; else echo "   Provisions  : container + LAT on EVERY storage account in scope using YOUR creds"; fi;;
-  customer_preprovision) echo "   Storage wr. : NONE to SP"; echo "   Provisions  : nothing (you create container + enable LAT yourself)";;
-esac
-echo "=============================================================="
-if [ "$ASSUME_YES" != "true" ]; then printf "Proceed? [y/N] "; read -r r; case "$r" in y|Y|yes|YES) ;; *) echo "Aborted."; exit 0 ;; esac; fi
+SP_OBJECT_ID="$(az ad sp list --all --filter "appId eq '${APP_ID}'" --query '[0].id' -o tsv --only-show-errors 2>/dev/null || true)"
+[[ -n "$SP_OBJECT_ID" ]] &&
+  SP_STATUS="EXISTS - will validate and reuse" ||
+  SP_STATUS="MISSING - will create the enterprise application"
 
-# ---- Main loop -------------------------------------------------------------
-fail=0
-for id in "${SCOPE_LIST[@]}"; do
-  scope="$(scope_path "$MODE" "$id")"
-  rname="$(role_name_for "$MODE" "$id")"
-  echo ""
-  echo ">> [${MODE}: ${id}] role '${rname}' (${#ACTIONS[@]} actions)..."
-  roleId="$(create_or_update_role "$rname" "$scope")"
-  if [ -z "$roleId" ]; then
-    echo "   ERROR: could not create/retrieve role '${rname}' at ${scope}."
-    [ "$MODE" = "mg" ] && echo "   (MG-scoped roles need roleDefinitions/write AT the MG - subscription Owner is not enough.)"
-    fail=1; continue
-  fi
-  echo "   role id: $roleId"
+ROLE_MATCHES="$(az role definition list --name "$ROLE_NAME" --custom-role-only true -o json --only-show-errors 2>/dev/null || printf '[]')"
+ROLE_COUNT="$(jq 'length' <<<"$ROLE_MATCHES")"
+[[ "$ROLE_COUNT" -le 1 ]] ||
+  die "Found multiple custom roles named '$ROLE_NAME'. Use --role-name with an unambiguous name."
 
-  # Assignments are ALWAYS at subscription scope. For MG mode, fan out to child subs.
-  if [ "$MODE" = "mg" ]; then
-    target_subs="$(subs_under_mg "$id")"
-    [ -z "$target_subs" ] && echo "   (no child subscriptions enumerated - check MG-reader access)"
-  else
-    target_subs="$id"
-  fi
-
-  for sub in $target_subs; do
-    echo "   --- subscription ${sub} ---"
-    echo "     assigning at /subscriptions/${sub} ..."
-    assign_role "$roleId" "/subscriptions/${sub}" || fail=1
-    if [ "$ENABLEMENT_MODE" = "setup_now" ]; then
-      echo "     provisioning container + LAT..."
-      provision_sub "$sub" || fail=1
-    fi
-  done
-done
-
-if [ "$ENABLEMENT_MODE" = "customer_preprovision" ]; then
-  echo ""
-  echo ">> Reminder (customer_preprovision): for each target storage account run -"
-  echo "     az storage container-rm create -g <rg> --storage-account <acct> -n ${INVENTORY_CONTAINER}"
-  echo "     az storage account blob-service-properties update -g <rg> -n <acct> --enable-last-access-tracking true"
+ROLE_EXISTS="false"
+ROLE_ID=""
+ROLE_COMPLIANT="false"
+ROLE_STATUS="MISSING - will create"
+EXISTING_ROLE="{}"
+if [[ "$ROLE_COUNT" -eq 1 ]]; then
+  ROLE_EXISTS="true"
+  EXISTING_ROLE="$(jq '.[0]' <<<"$ROLE_MATCHES")"
+  ROLE_ID="$(jq -r '.name' <<<"$EXISTING_ROLE")"
+  ROLE_COMPLIANT="$(
+    jq -n --argjson role "$EXISTING_ROLE" \
+      --argjson requiredActions "$ACTIONS_JSON" \
+      --argjson requiredDataActions "$DATA_ACTIONS_JSON" \
+      --arg scope "$MG_SCOPE" '
+        (($requiredActions - ($role.permissions | map(.actions // []) | add)) | length) == 0 and
+        (($requiredDataActions - ($role.permissions | map(.dataActions // []) | add)) | length) == 0 and
+        ($role.assignableScopes == [$scope])
+      '
+  )"
+  [[ "$ROLE_COMPLIANT" == "true" ]] &&
+    ROLE_STATUS="EXISTS - permissions and scope are compliant" ||
+    ROLE_STATUS="EXISTS - will merge missing permissions and set the MG scope"
 fi
 
-# ---- Summary ---------------------------------------------------------------
-echo ""
 echo "=============================================================="
-echo " Setup summary"
-echo "   Mode        : ${ENABLEMENT_MODE}"
-echo "   Scope mode  : ${MODE}   targets: ${SCOPE_LIST[*]}"
-echo "   Role naming : ${ROLE_PREFIX}-${MODE}-<id>  (${#ACTIONS[@]} actions each)"
-echo "   ABAC gate   : blobs/read -> '${INVENTORY_CONTAINER}'"
-echo "   TenantId    : ${tenantId}"
-[ "$fail" -eq 0 ] && echo " Status       : COMPLETE" || echo " Status       : COMPLETED WITH ERRORS - review above"
+echo "Lucidity Azure assessment onboarding plan"
+echo "  Script version       : $SCRIPT_VERSION"
+echo "  Tenant              : $TENANT_ID"
+echo "  Signed in as         : $SIGNED_IN_AS"
+echo "  Management group    : $MG_ID"
+echo "  Selection mode      : $SELECTION_MODE"
+echo "  MG child subscriptions: ${#ALL_SUBSCRIPTIONS[@]}"
+echo "  Selected subscriptions: ${#SUBSCRIPTIONS[@]}"
+[[ -n "$SUBSCRIPTION_ID" ]] && echo "  Pilot subscription  : ${SUBSCRIPTIONS[0]}"
+echo "  Enterprise app      : $SP_STATUS"
+echo "  Custom role         : $ROLE_NAME"
+echo "  Role status         : $ROLE_STATUS"
+echo "  Role assignment     : subscription-level fan-out"
+echo "  Blob read condition : container '$CONTAINER' only"
+echo "  Permission profile  : discovery reads + Run Command + storage enablement"
+echo "  Mode                : $([[ "$EXECUTE" == "true" ]] && echo EXECUTE || echo PLAN-ONLY)"
 echo "=============================================================="
-exit $fail
+
+if [[ "$EXECUTE" != "true" ]]; then
+  echo
+  echo "No changes made. Review the plan, then rerun with --execute."
+  exit 0
+fi
+if [[ "$ASSUME_YES" != "true" ]]; then
+  read -r -p "Proceed with onboarding? [y/N] " REPLY
+  [[ "$REPLY" =~ ^([yY]|[yY][eE][sS])$ ]] || { echo "Aborted."; exit 0; }
+fi
+
+if [[ -z "$SP_OBJECT_ID" ]]; then
+  echo ">> Creating the Lucidity enterprise application in this tenant..."
+  SP_OBJECT_ID="$(az ad sp create --id "$APP_ID" --query id -o tsv --only-show-errors)"
+  [[ -n "$SP_OBJECT_ID" ]] ||
+    die "Enterprise application creation failed. Ask an Entra administrator to create it, then rerun."
+else
+  echo ">> Enterprise application already exists; reusing $SP_OBJECT_ID."
+fi
+
+if [[ "$ROLE_EXISTS" == "true" ]]; then
+  MG_ASSIGNMENTS="$(az role assignment list --scope "$MG_SCOPE" --role "$ROLE_ID" -o json --only-show-errors)"
+  FOREIGN_COUNT="$(
+    jq --arg sp "${SP_OBJECT_ID,,}" --arg scope "${MG_SCOPE,,}" '
+      [.[] | select(
+        (.scope // "" | ascii_downcase) == $scope and
+        (.principalId // "" | ascii_downcase) != $sp
+      )] | length' <<<"$MG_ASSIGNMENTS"
+  )"
+  [[ "$FOREIGN_COUNT" -eq 0 ]] ||
+    die "The existing role has a direct MG assignment for another principal. Remove or redesign it before continuing."
+
+  mapfile -t LUCIDITY_MG_IDS < <(
+    jq -r --arg sp "${SP_OBJECT_ID,,}" --arg scope "${MG_SCOPE,,}" '
+      .[] | select(
+        (.scope // "" | ascii_downcase) == $scope and
+        (.principalId // "" | ascii_downcase) == $sp
+      ) | .id' <<<"$MG_ASSIGNMENTS"
+  )
+  for ASSIGNMENT_ID in "${LUCIDITY_MG_IDS[@]}"; do
+    [[ -n "$ASSIGNMENT_ID" ]] || continue
+    echo ">> Removing incompatible Lucidity assignment at management-group scope..."
+    az role assignment delete --ids "$ASSIGNMENT_ID" --only-show-errors
+  done
+
+  if [[ "$ROLE_COMPLIANT" == "true" ]]; then
+    echo ">> Custom role is already compliant; no definition update required."
+  else
+    UPDATED_ROLE="$(
+      jq -n --argjson role "$EXISTING_ROLE" \
+        --argjson requiredActions "$ACTIONS_JSON" \
+        --argjson requiredDataActions "$DATA_ACTIONS_JSON" \
+        --arg scope "$MG_SCOPE" --arg description "$DESCRIPTION" '
+          $role
+          | .description = $description
+          | .permissions = [{
+              actions: (((.permissions | map(.actions // []) | add) + $requiredActions) | unique),
+              notActions: ((.permissions | map(.notActions // []) | add) | unique),
+              dataActions: (((.permissions | map(.dataActions // []) | add) + $requiredDataActions) | unique),
+              notDataActions: ((.permissions | map(.notDataActions // []) | add) | unique)
+            }]
+          | .assignableScopes = [$scope]
+          | del(.createdOn, .updatedOn, .createdBy, .updatedBy, .type)
+        '
+    )"
+    ROLE_FILE="$(mktemp)"
+    trap 'rm -f "${ROLE_FILE:-}"' EXIT
+    printf '%s\n' "$UPDATED_ROLE" >"$ROLE_FILE"
+    echo ">> Updating the existing custom role; its role-definition ID is preserved..."
+    ROLE_ID="$(az role definition update --role-definition "$ROLE_FILE" --query name -o tsv --only-show-errors)"
+  fi
+else
+  ROLE_FILE="$(mktemp)"
+  trap 'rm -f "${ROLE_FILE:-}"' EXIT
+  jq -n --arg name "$ROLE_NAME" --arg description "$DESCRIPTION" \
+    --arg scope "$MG_SCOPE" --argjson actions "$ACTIONS_JSON" \
+    --argjson dataActions "$DATA_ACTIONS_JSON" \
+    '{Name:$name, IsCustom:true, Description:$description, Actions:$actions,
+      NotActions:[], DataActions:$dataActions, NotDataActions:[],
+      AssignableScopes:[$scope]}' >"$ROLE_FILE"
+  echo ">> Creating the custom role at management-group scope..."
+  ROLE_ID="$(az role definition create --role-definition "$ROLE_FILE" --query name -o tsv --only-show-errors)"
+fi
+[[ -n "$ROLE_ID" ]] || die "Could not resolve the custom role-definition ID."
+
+direct_assignments() {
+  local scope="$1" output attempt
+  for attempt in 1 2 3 4 5 6; do
+    if output="$(az role assignment list --scope "$scope" -o json --only-show-errors 2>/dev/null)"; then
+      jq --arg scope "${scope,,}" --arg principal "${SP_OBJECT_ID,,}" \
+        --arg role "${ROLE_ID,,}" '
+          [.[] | select((.scope // "" | ascii_downcase) == $scope)
+            | select((.principalId // "" | ascii_downcase) == $principal)
+            | select((.roleDefinitionId // "" | split("/")[-1] | ascii_downcase) == $role)]' <<<"$output"
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+condition_is_compliant() {
+  jq -e --arg condition "$CONDITION" '
+    any(.[]; (.conditionVersion // "") == "2.0" and
+      (((.condition // "") | gsub("\\s"; "")) == ($condition | gsub("\\s"; ""))))' >/dev/null
+}
+
+CREATED=0; REPLACED=0; SKIPPED=0; FAILED=0
+for SUB_ID in "${SUBSCRIPTIONS[@]}"; do
+  SUB_SCOPE="/subscriptions/${SUB_ID}"
+  echo ">> Subscription: $SUB_ID"
+  if ! EXISTING_ASSIGNMENTS="$(direct_assignments "$SUB_SCOPE")"; then
+    echo "   FAILED to check existing assignments after retries; no change made."
+    FAILED=$((FAILED + 1))
+    continue
+  fi
+  if condition_is_compliant <<<"$EXISTING_ASSIGNMENTS"; then
+    echo "   Assignment already compliant; skipped."
+    SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
+
+  mapfile -t OLD_IDS < <(jq -r '.[].id' <<<"$EXISTING_ASSIGNMENTS")
+  HAD_OLD="false"; DELETE_FAILED="false"
+  for OLD_ID in "${OLD_IDS[@]}"; do
+    [[ -n "$OLD_ID" ]] || continue
+    HAD_OLD="true"
+    echo "   Replacing existing assignment to apply the Blob read condition..."
+    if ! az role assignment delete --ids "$OLD_ID" --only-show-errors; then
+      echo "   FAILED to replace the existing assignment."
+      FAILED=$((FAILED + 1)); DELETE_FAILED="true"; break
+    fi
+  done
+  [[ "$DELETE_FAILED" == "false" ]] || continue
+
+  CREATED_OK="false"; ALREADY_EXISTS="false"; LAST_ERROR=""
+  for ATTEMPT in 1 2 3 4 5 6; do
+    if CREATE_OUTPUT="$(az role assignment create \
+      --assignee-object-id "$SP_OBJECT_ID" \
+      --assignee-principal-type ServicePrincipal \
+      --role "$ROLE_ID" --scope "$SUB_SCOPE" \
+      --condition "$CONDITION" --condition-version "2.0" \
+      --only-show-errors 2>&1)"; then
+      CREATED_OK="true"; break
+    fi
+    LAST_ERROR="$CREATE_OUTPUT"
+    [[ "$CREATE_OUTPUT" == *"RoleAssignmentExists"* ]] &&
+      { ALREADY_EXISTS="true"; break; }
+    sleep 5
+  done
+
+  if [[ "$CREATED_OK" == "true" ]]; then
+    echo "   Assigned with Blob read restricted to '$CONTAINER'."
+    [[ "$HAD_OLD" == "true" ]] &&
+      REPLACED=$((REPLACED + 1)) || CREATED=$((CREATED + 1))
+  elif [[ "$ALREADY_EXISTS" == "true" ]]; then
+    echo "   Assignment already exists in Azure; skipped."
+    SKIPPED=$((SKIPPED + 1))
+  else
+    echo "   FAILED: $(tr '\n' ' ' <<<"$LAST_ERROR" | sed 's/  */ /g')"
+    FAILED=$((FAILED + 1))
+  fi
+done
+
+echo "=============================================================="
+echo "Onboarding summary"
+echo "  Enterprise app : validated ($SP_OBJECT_ID)"
+echo "  Custom role    : validated ($ROLE_NAME / $ROLE_ID)"
+echo "  Subscriptions  : ${#SUBSCRIPTIONS[@]}"
+echo "  Created        : $CREATED"
+echo "  Replaced       : $REPLACED"
+echo "  Skipped        : $SKIPPED"
+echo "  Failed         : $FAILED"
+echo "=============================================================="
+[[ "$FAILED" -eq 0 ]] || exit 1
