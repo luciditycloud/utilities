@@ -4,11 +4,25 @@ set -Eeuo pipefail
 # Lucidity Azure read-only onboarding (management-group workflow).
 # Default is plan-only. Add --execute to make changes.
 # Requires Azure Cloud Shell Bash, Azure CLI and jq.
+# Requires bash 4+; macOS's built-in bash (3.2) is not supported.
+#
+# What it does:
+#   - Creates or reuses Lucidity's enterprise application in your tenant.
+#   - Creates or updates the custom role ROLE_NAME at the management group.
+#   - Assigns the role to Lucidity on every child subscription (or one pilot
+#     subscription), with Blob data read limited to the 'lucidity-inventory'
+#     container.
+# --network-audit / --network-config only check or add Lucidity's Blob firewall
+# rules; they make no identity or role changes.
+# To remove Lucidity later, use teardown.sh.
 
 SCRIPT_VERSION="2.2.0"
 APP_ID="4f2c2c1f-372a-4904-b13d-11e2467679f2"
+# Role names are unique per tenant: use a different --role-name for each
+# management group you onboard in the same tenant.
 ROLE_NAME="LUCIDITY_PLATFORM"
 CONTAINER="lucidity-inventory"
+# Lucidity's Blob collector egress IP and backend subnet (added by --network-config).
 LUCIDITY_BLOB_EGRESS_IP="4.157.111.90"
 LUCIDITY_BACKEND_SUBNET="/subscriptions/3511ac94-c2ef-4644-8147-55f5f9a27a9e/resourceGroups/azurepls-rg/providers/Microsoft.Network/virtualNetworks/azurepls-vnet/subnets/aks-subnet"
 MG_ID=""
@@ -17,6 +31,7 @@ NETWORK_MODE=""
 EXECUTE="false"
 ASSUME_YES="false"
 
+# Permissions granted to Lucidity. Mostly read-only; the exceptions are marked.
 ACTIONS=(
   "Microsoft.Compute/availabilitySets/read"
   "Microsoft.Compute/diskEncryptionSets/read"
@@ -33,6 +48,8 @@ ACTIONS=(
   "Microsoft.Compute/virtualMachines/read"
   "Microsoft.Compute/virtualMachines/extensions/read"
   "Microsoft.Compute/virtualMachines/instanceView/read"
+  # Run Command (VMs and scale-set instances): lets Lucidity run collection
+  # scripts inside the guest OS.
   "Microsoft.Compute/virtualMachines/runCommand/action"
   "Microsoft.Compute/virtualMachines/runCommands/read"
   "Microsoft.Compute/virtualMachines/runCommands/write"
@@ -54,6 +71,9 @@ ACTIONS=(
   "Microsoft.RecoveryServices/vaults/replicationProtectedItems/read"
   "Microsoft.Storage/storageAccounts/read"
   "Microsoft.Storage/storageAccounts/blobServices/read"
+  # Storage enablement (blobServices/write, containers/write, inventoryPolicies
+  # write/delete): create 'lucidity-inventory', enable Last Access Time
+  # tracking, and manage the Blob inventory policy that reports into it.
   "Microsoft.Storage/storageAccounts/blobServices/write"
   "Microsoft.Storage/storageAccounts/blobServices/containers/read"
   "Microsoft.Storage/storageAccounts/blobServices/containers/write"
@@ -88,6 +108,7 @@ ACTIONS=(
   "Microsoft.Authorization/roleAssignments/read"
   "Microsoft.Authorization/roleDefinitions/read"
 )
+# Blob data read, limited to 'lucidity-inventory' by CONDITION on each assignment.
 DATA_ACTIONS=("Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read")
 
 usage() {
@@ -141,6 +162,7 @@ need az
 need jq
 
 MG_SCOPE="/providers/Microsoft.Management/managementGroups/${MG_ID}"
+# Allows Blob reads only in 'lucidity-inventory'; other permissions are unaffected.
 CONDITION="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'})) OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals '${CONTAINER}'))"
 DESCRIPTION="Lucidity assessment role with discovery reads, Run Command collection and limited storage enablement actions. Blob data read is limited to '${CONTAINER}' by each subscription assignment."
 ACTIONS_JSON="$(printf '%s\n' "${ACTIONS[@]}" | jq -R . | jq -s 'unique')"
@@ -152,6 +174,7 @@ SIGNED_IN_AS="$(az account show --query user.name -o tsv --only-show-errors)"
 az account management-group show --name "$MG_ID" --only-show-errors >/dev/null ||
   die "Cannot read management group '$MG_ID'. Check the ID and your access."
 
+# All subscriptions under the management group, including nested groups.
 mapfile -t ALL_SUBSCRIPTIONS < <(
   az account management-group entities list --only-show-errors \
     --query "[?type=='/subscriptions' && contains(parentNameChain, '${MG_ID}')].name" -o tsv | sort -u
@@ -176,6 +199,11 @@ else
   SUBSCRIPTIONS=("${ALL_SUBSCRIPTIONS[@]}")
 fi
 
+# ---- Blob network audit / configuration -------------------------------------
+# Each storage account is reported as COMPLIANT, CONFIGURATION REQUIRED (Lucidity
+# IP or subnet rule missing) or MANUAL REVIEW (public network access disabled).
+# --network-config adds only the missing rules; it never removes rules or
+# changes the firewall's default action.
 if [[ -n "$NETWORK_MODE" ]]; then
   echo "=============================================================="
   echo "Lucidity Blob network $([[ "$NETWORK_MODE" == "audit" ]] && echo audit || echo configuration)"
@@ -358,6 +386,7 @@ if [[ -n "$NETWORK_MODE" ]]; then
   exit 0
 fi
 
+# ---- Plan (no changes) -------------------------------------------------------
 SP_OBJECT_ID="$(az ad sp list --all --filter "appId eq '${APP_ID}'" --query '[0].id' -o tsv --only-show-errors 2>/dev/null || true)"
 [[ -n "$SP_OBJECT_ID" ]] &&
   SP_STATUS="EXISTS - will validate and reuse" ||
@@ -373,6 +402,8 @@ ROLE_ID=""
 ROLE_COMPLIANT="false"
 ROLE_STATUS="MISSING - will create"
 EXISTING_ROLE="{}"
+# An existing role is compliant if it has every required permission and is
+# assignable at exactly this management group.
 if [[ "$ROLE_COUNT" -eq 1 ]]; then
   ROLE_EXISTS="true"
   EXISTING_ROLE="$(jq '.[0]' <<<"$ROLE_MATCHES")"
@@ -421,6 +452,7 @@ if [[ "$ASSUME_YES" != "true" ]]; then
   [[ "$REPLY" =~ ^([yY]|[yY][eE][sS])$ ]] || { echo "Aborted."; exit 0; }
 fi
 
+# ---- Execute -----------------------------------------------------------------
 if [[ -z "$SP_OBJECT_ID" ]]; then
   echo ">> Creating the Lucidity enterprise application in this tenant..."
   SP_OBJECT_ID="$(az ad sp create --id "$APP_ID" --query id -o tsv --only-show-errors)"
@@ -430,6 +462,8 @@ else
   echo ">> Enterprise application already exists; reusing $SP_OBJECT_ID."
 fi
 
+# A role with Blob data permissions can't be assigned at management-group scope:
+# remove Lucidity's own MG-level assignment, and stop if another principal has one.
 if [[ "$ROLE_EXISTS" == "true" ]]; then
   MG_ASSIGNMENTS="$(az role assignment list --scope "$MG_SCOPE" --role "$ROLE_ID" -o json --only-show-errors)"
   FOREIGN_COUNT="$(
@@ -458,6 +492,8 @@ if [[ "$ROLE_EXISTS" == "true" ]]; then
   if [[ "$ROLE_COMPLIANT" == "true" ]]; then
     echo ">> Custom role is already compliant; no definition update required."
   else
+    # Update in place (role ID unchanged): add missing permissions, keep existing
+    # ones, and make the role assignable at this management group only.
     UPDATED_ROLE="$(
       jq -n --argjson role "$EXISTING_ROLE" \
         --argjson requiredActions "$ACTIONS_JSON" \
@@ -517,6 +553,9 @@ condition_is_compliant() {
       (((.condition // "") | gsub("\\s"; "")) == ($condition | gsub("\\s"; ""))))' >/dev/null
 }
 
+# Per subscription: skip if already compliant; otherwise replace the assignment
+# so it carries the Blob read condition. Retries cover Azure replication delays;
+# RoleAssignmentExists means an earlier run already created it.
 CREATED=0; REPLACED=0; SKIPPED=0; FAILED=0
 for SUB_ID in "${SUBSCRIPTIONS[@]}"; do
   SUB_SCOPE="/subscriptions/${SUB_ID}"
