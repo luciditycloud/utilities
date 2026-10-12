@@ -46,7 +46,8 @@ storage-write implications) and asks `Proceed? [y/N]` before touching
 anything. Pass `-y` to skip that prompt for unattended/CI runs.
 
 See *Usage* below for management-group scoping, the other enablement modes,
-multiple scopes at once, and `--clear`.
+and multiple scopes at once. To remove the access again, see
+[*Removing access (`teardown.sh`)*](#removing-access-teardownsh).
 
 ## Usage
 
@@ -80,11 +81,6 @@ chmod +x read-only.sh
 
 # Override the role-name prefix (default: lucidity-permissions-readonly).
 ./read-only.sh -s "<sub-id>" -p my-custom-prefix
-
-# Remove everything this script created at a given scope — deletes
-# Lucidity's assignments first, then the role definition(s).
-./read-only.sh --clear -s "<sub-id>"
-./read-only.sh --clear -m "<mg-id>" -p my-custom-prefix -y
 ```
 
 ### Options
@@ -96,7 +92,6 @@ chmod +x read-only.sh
 | `-e <mode>` | `lucidity_self` | Enablement mode: `lucidity_self` \| `setup_now` \| `customer_preprovision` — see the table above. |
 | `-a "<accts>"` | *(all in scope)* | Only used with `-e setup_now`. Restricts self-provisioning to these storage account names, comma- or space-separated. |
 | `-p <prefix>` | `lucidity-permissions-readonly` | Override the custom role name prefix. |
-| `-c`, `--clear` | off | Clear mode — deletes every custom role starting with the prefix at the given scope(s), and Lucidity's assignments to them. |
 | `-y`, `--yes` | off | Skip the `Proceed? [y/N]` confirmation prompt — required for unattended/CI runs. |
 | `-h`, `--help` | — | Show usage. |
 
@@ -137,9 +132,11 @@ Proceed? [y/N] y
 
 ## What it actually does
 
-1. **Logs in** (if not already) and resolves Lucidity's service principal
-   (app id `4f2c2c1f-372a-4904-b13d-11e2467679f2`) in your tenant, creating
-   it if it doesn't exist yet.
+1. **Checks the Azure CLI is installed, logs in** (if not already) and
+   resolves Lucidity's service principal (app id
+   `4f2c2c1f-372a-4904-b13d-11e2467679f2`) in your tenant, creating it if it
+   doesn't exist yet. If your account can't read or create it, the script
+   stops and shows the Azure CLI's reason.
 2. **Builds one custom role per scope you pass** — named
    `<prefix>-mg-<mgId>` or `<prefix>-sub-<subId>` — containing:
    - ~65 read-only control-plane actions across Compute, Networking,
@@ -158,9 +155,8 @@ Proceed? [y/N] y
 4. **Provisions storage prerequisites**, depending on `-e` mode (see below):
    Lucidity self-provisions, you provision now with this script using your
    own credentials, or you provision it yourself later.
-5. **`--clear`** reverses all of it: finds every custom role starting with
-   the prefix at the scope(s) you give it, removes Lucidity's assignments
-   to each one, then deletes the role definition.
+
+To reverse steps 2–3, use [`teardown.sh`](#removing-access-teardownsh).
 
 Re-running the setup command is safe — existing roles are updated in place,
 and a prior assignment to the same role/scope is removed and recreated
@@ -182,11 +178,19 @@ rather Lucidity hold no write permissions at all, use `setup_now` or
 
 ## Troubleshooting
 
-- **"could not resolve Lucidity SP. Contact Lucidity."** — your identity
-  can't create/read the service principal for that app id in this tenant.
-  Confirm you're logged into the correct tenant (`az account show`) and
-  have permission to create service principals, or ask a tenant admin to
-  do it once beforehand.
+- **"Azure CLI (az) not found"** / **"Azure CLI login failed"** — install
+  the Azure CLI or run the script in Azure Cloud Shell, and make sure
+  `az login` succeeds for the right tenant (`az account show`).
+- **"your account cannot read service principals in Microsoft Entra ID"** —
+  the printed Azure CLI error gives the reason. Ask an administrator for
+  directory read access, then rerun.
+- **"your account cannot create Lucidity's service principal"** — Lucidity's
+  service principal isn't in your tenant yet and your account isn't allowed
+  to create it. Ask an Entra administrator (e.g. Application Administrator)
+  to run `az ad sp create --id 4f2c2c1f-372a-4904-b13d-11e2467679f2` once,
+  then rerun.
+- **"could not resolve Lucidity SP. Contact Lucidity."** — the Azure CLI
+  commands succeeded but returned no service principal. Contact Lucidity.
 - **"could not create/retrieve role... (MG-scoped roles need
   roleDefinitions/write AT the MG - subscription Owner is not enough.)"** —
   exactly what it says: grant the role-creating identity a role like Owner
@@ -205,6 +209,40 @@ rather Lucidity hold no write permissions at all, use `setup_now` or
   keeps going and reports it in the per-subscription output; check that
   your logged-in identity has write access to that specific storage
   account (a resource lock or a Contributor-scope gap are common causes).
-- **Want to undo a run** — use `--clear` with the same scope flag(s) (and
-  `-p` if you used a custom prefix). It removes Lucidity's assignments
-  before deleting the role definitions, so nothing is left orphaned.
+- **Want to undo a run** — use `teardown.sh` with the same scope flag(s) (and
+  `-p` if you used a custom prefix). See below.
+
+## Removing access (`teardown.sh`)
+
+`teardown.sh` replaces the old `--clear` flag of `read-only.sh`. At each scope
+you give it, it finds every custom role whose name starts with the prefix and
+Lucidity's assignments to it (with `-m`, on every subscription under the
+management group), lists them, then asks for approval before each step:
+
+1. **Remove Lucidity's role assignments.**
+2. **Delete the role definitions.** Azure won't delete a role that is still
+   assigned, so if step 1 was skipped or partly failed, the script warns you
+   before asking.
+
+Answering no at a step skips it; nothing is changed before the first approval.
+`-y` approves both steps without prompting.
+
+```bash
+chmod +x teardown.sh
+
+./teardown.sh -s "<sub-id>"
+./teardown.sh -m "<mg-id>" -p my-custom-prefix -y
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-m "<mgIds>"` | — | Management group id(s), comma- or space-separated. Exactly one of `-m` / `-s` is required. |
+| `-s "<subIds>"` | — | Subscription id(s), comma- or space-separated. Exactly one of `-m` / `-s` is required. |
+| `-p <prefix>` | `lucidity-permissions-readonly` | Role-name prefix used at onboarding. |
+| `-y`, `--yes` | off | Approve both steps without prompting — for unattended runs. |
+| `-h`, `--help` | — | Show usage. |
+
+It does **not** remove the `lucidity-inventory` containers, Last Access Time
+tracking, Blob inventory policies, or Lucidity's service principal. It only
+looks up the service principal and never creates it. Running
+`read-only.sh --clear` now prints a pointer to `teardown.sh`.

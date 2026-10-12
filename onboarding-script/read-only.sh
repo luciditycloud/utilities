@@ -1,42 +1,44 @@
 #!/bin/bash
 # =============================================================================
-# Lucidity - PERMISSIONS_READONLY setup (per-scope roles)
+# Lucidity - read-only assessment onboarding for Azure
 # -----------------------------------------------------------------------------
-# ONE custom role PER SCOPE, so a role is always welded to a single scope and
-# can be managed/deleted from that scope (no cross-scope collisions):
+# Grants Lucidity's service principal a custom, mostly read-only role so it can
+# assess your Azure estate. One role is created per scope:
 #
-#   -m "<mgIds>"    -> per MG:  <prefix>-mg-<mgId>   homed at that MG,
-#                      assigned at the MG scope (inherited by all child subs).
-#   -s "<subIds>"   -> per sub: <prefix>-sub-<subId> homed at that sub,
-#                      assigned at that subscription scope.
-#   IDs may be comma- or space-separated. Exactly one of -m / -s.
+#   -m "<mgIds>"   role <prefix>-mg-<mgId>, defined at the management group and
+#                  assigned on each subscription under it.
+#   -s "<subIds>"  role <prefix>-sub-<subId>, defined and assigned at the
+#                  subscription.
+#   IDs may be comma- or space-separated. Provide exactly one of -m / -s.
 #
-# ENABLEMENT_MODE (-e) decides WHO provisions 'lucidity-inventory' + LAT, and
-# therefore whether the role carries storage writes:
-#   lucidity_self          role KEEPS containers/write + blobServices/write; SP self-provisions.
-#   setup_now  (tightest)  role has NO storage writes; THIS run provisions with YOUR creds.
-#   customer_preprovision  role has NO storage writes; you provision separately.
+# Blob data read is limited to the 'lucidity-inventory' container by a
+# condition on each role assignment.
 #
-# --clear (-c) with -m/-s : deletes every custom role whose name starts with the
-#   prefix at the given scope(s), first removing Lucidity's assignments to them.
-#   Prefix defaults to ROLE_PREFIX; override with -p.
+# Enablement mode (-e) decides who creates 'lucidity-inventory' and turns on
+# Last Access Time (LAT) tracking on your storage accounts:
+#   lucidity_self          Lucidity does it (default). The role includes the
+#                          container and Blob-service write permissions.
+#   setup_now              This script does it now, with your credentials.
+#                          The role omits those two write permissions.
+#   customer_preprovision  You do it separately. The role omits those two
+#                          write permissions.
 #
-# ABAC: a v2.0 condition limits blob DATA read (blobs/read) to 'lucidity-inventory'.
-#   NOTE: at MG scope the condition is enforced but NOT viewable/editable in the
-#   Azure portal (CLI only): az role assignment list --scope <mg> --query "[].condition".
-#   Container CREATION is a control-plane action and is never ABAC-name-restrictable.
+# To remove the roles and assignments again, use teardown.sh.
 #
-# Flags: -m -s | -e <mode> | -a "<accts>" (setup_now) | -p <prefix> | -c/--clear | -y | -h
-# Requires: az CLI (logged in), bash. No jq/python dependency.
+# Flags: -m | -s | -e <mode> | -a "<accts>" (setup_now) | -p <prefix> | -y | -h
+# Requires: Azure CLI (logged in) and bash. No jq/python dependency.
 # =============================================================================
 
 # ---- Config ----------------------------------------------------------------
+# Lucidity's application ID; its service principal in your tenant gets the role.
 LUCIDITYAPPID="4f2c2c1f-372a-4904-b13d-11e2467679f2"
 ROLE_PREFIX="lucidity-permissions-readonly"
 INVENTORY_CONTAINER="lucidity-inventory"
 ENABLEMENT_MODE="lucidity_self"
+# Allows Blob reads only in 'lucidity-inventory'; other permissions are unaffected.
 LUCIDITY_READ_CONDITION="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'})) OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals '${INVENTORY_CONTAINER}'))"
 
+# Permissions granted to Lucidity. Mostly read-only; the exceptions are marked.
 ACTIONS=(
   "Microsoft.Compute/availabilitySets/read"
   "Microsoft.Compute/diskEncryptionSets/read"
@@ -53,6 +55,8 @@ ACTIONS=(
   "Microsoft.Compute/virtualMachines/read"
   "Microsoft.Compute/virtualMachines/extensions/read"
   "Microsoft.Compute/virtualMachines/instanceView/read"
+  # Run Command (VMs and scale-set instances): lets Lucidity run collection
+  # scripts inside the guest OS.
   "Microsoft.Compute/virtualMachines/runCommand/action"
   "Microsoft.Compute/virtualMachines/runCommands/read"
   "Microsoft.Compute/virtualMachines/runCommands/write"
@@ -74,13 +78,17 @@ ACTIONS=(
   "Microsoft.RecoveryServices/vaults/replicationProtectedItems/read"
   "Microsoft.Storage/storageAccounts/read"
   "Microsoft.Storage/storageAccounts/blobServices/read"
+  # Write: turn on LAT tracking (lucidity_self mode only).
   "Microsoft.Storage/storageAccounts/blobServices/write"
   "Microsoft.Storage/storageAccounts/blobServices/containers/read"
+  # Write: create 'lucidity-inventory' (lucidity_self mode only).
   "Microsoft.Storage/storageAccounts/blobServices/containers/write"
   "Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"
   "Microsoft.Storage/storageAccounts/fileServices/read"
   "Microsoft.Storage/storageAccounts/fileServices/shares/read"
   "Microsoft.Storage/storageAccounts/inventoryPolicies/read"
+  # Write/delete: manage the Blob inventory policy that reports into
+  # 'lucidity-inventory' (all modes).
   "Microsoft.Storage/storageAccounts/inventoryPolicies/write"
   "Microsoft.Storage/storageAccounts/inventoryPolicies/delete"
   "Microsoft.Storage/storageAccounts/managementPolicies/read"
@@ -108,7 +116,9 @@ ACTIONS=(
   "Microsoft.Authorization/roleAssignments/read"
   "Microsoft.Authorization/roleDefinitions/read"
 )
+# Blob data read, limited to 'lucidity-inventory' by LUCIDITY_READ_CONDITION.
 DATA_ACTIONS=( "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read" )
+# Removed from the role unless the mode is lucidity_self.
 ENABLEMENT_WRITES=(
   "Microsoft.Storage/storageAccounts/blobServices/containers/write"
   "Microsoft.Storage/storageAccounts/blobServices/write"
@@ -118,7 +128,7 @@ ENABLEMENT_WRITES=(
 args=()
 for a in "$@"; do
   case "$a" in
-    --clear) args+=("-c") ;;
+    -c|--clear) echo "ERROR: --clear has moved to teardown.sh (same -m / -s / -p / -y flags)."; exit 1 ;;
     --yes)   args+=("-y") ;;
     --help)  args+=("-h") ;;
     *)       args+=("$a") ;;
@@ -127,29 +137,27 @@ done
 set -- "${args[@]}"
 
 # ---- Arg parsing -----------------------------------------------------------
-MG_INPUT=""; SUB_INPUT=""; ACCT_INPUT=""; ASSUME_YES="false"; MODE_INPUT=""; PREFIX_INPUT=""; DO_CLEAR="false"
+MG_INPUT=""; SUB_INPUT=""; ACCT_INPUT=""; ASSUME_YES="false"; MODE_INPUT=""; PREFIX_INPUT=""
 usage() {
   echo "Usage:"
-  echo "  Setup : $0 (-m \"<mgIds>\" | -s \"<subIds>\") [-e <mode>] [-a \"<accts>\"] [-y]"
-  echo "  Clear : $0 --clear (-m \"<mgIds>\" | -s \"<subIds>\") [-p <prefix>] [-y]"
-  echo "  -m  management group ids (per-MG role, assigned at MG scope)"
-  echo "  -s  subscription ids     (per-sub role, assigned at sub scope)"
+  echo "  $0 (-m \"<mgIds>\" | -s \"<subIds>\") [-e <mode>] [-a \"<accts>\"] [-p <prefix>] [-y]"
+  echo "  -m  management group ids (per-MG role, assigned on each child subscription)"
+  echo "  -s  subscription ids     (per-sub role, assigned at the subscription)"
   echo "  -e  mode: lucidity_self | setup_now | customer_preprovision (default: ${ENABLEMENT_MODE})"
   echo "  -a  (setup_now) limit provisioning to these storage accounts"
   echo "  -p  role-name prefix (default: ${ROLE_PREFIX})"
-  echo "  -c, --clear   delete all roles with the prefix at the given scope(s)"
   echo "  -y, --yes     skip confirmation"
   echo "  IDs may be comma- or space-separated. Provide exactly one of -m / -s."
+  echo "  To remove the roles and assignments, use teardown.sh."
   exit 1
 }
-while getopts ":m:s:a:e:p:cyh" opt; do
+while getopts ":m:s:a:e:p:yh" opt; do
   case "$opt" in
     m) MG_INPUT="$OPTARG" ;;
     s) SUB_INPUT="$OPTARG" ;;
     a) ACCT_INPUT="$OPTARG" ;;
     e) MODE_INPUT="$OPTARG" ;;
     p) PREFIX_INPUT="$OPTARG" ;;
-    c) DO_CLEAR="true" ;;
     y) ASSUME_YES="true" ;;
     h) usage ;;
     *) usage ;;
@@ -164,6 +172,7 @@ if { [ -n "$MG_INPUT" ] && [ -n "$SUB_INPUT" ]; } || { [ -z "$MG_INPUT" ] && [ -
   echo "ERROR: provide exactly one of -m or -s."; usage
 fi
 
+# Accept IDs separated by commas and/or spaces.
 normalize() { echo "$1" | tr ',' ' ' | xargs; }
 MODE=""; SCOPE_LIST=()
 if [ -n "$MG_INPUT" ]; then MODE="mg"; read -ra SCOPE_LIST <<< "$(normalize "$MG_INPUT")"
@@ -171,6 +180,8 @@ else MODE="sub"; read -ra SCOPE_LIST <<< "$(normalize "$SUB_INPUT")"; fi
 ACCT_FILTER="$(normalize "$ACCT_INPUT")"
 
 # ---- Drop storage writes unless SP self-provisions -------------------------
+# In setup_now / customer_preprovision Lucidity doesn't create the container or
+# enable LAT, so it doesn't get those two write permissions.
 if [ "$ENABLEMENT_MODE" != "lucidity_self" ]; then
   tmp=(); for a in "${ACTIONS[@]}"; do
     skip=0; for w in "${ENABLEMENT_WRITES[@]}"; do [ "$a" = "$w" ] && skip=1 && break; done
@@ -186,12 +197,37 @@ scope_path() {  # $1=mg|sub  $2=id
 }
 role_name_for() { echo "${ROLE_PREFIX}-$1-$2"; }   # $1=mg|sub $2=id
 
+# Find Lucidity's service principal in your tenant, creating it if missing.
+# Each failure reports its actual cause; the generic message is the last resort.
 resolve_sp() {
-  servicePrincipalId=$(az ad sp create --id "$LUCIDITYAPPID" --query id -o tsv --only-show-errors 2>/dev/null)
-  [ -z "$servicePrincipalId" ] && servicePrincipalId=$(az ad sp list --all --query "[?appId=='${LUCIDITYAPPID}'].id" -o tsv --only-show-errors)
+  local out
+  # 1. Can your account read service principals in Microsoft Entra ID?
+  if ! out=$(az ad sp list --filter "appId eq '${LUCIDITYAPPID}'" --query "[0].id" -o tsv --only-show-errors 2>&1); then
+    echo "ERROR: your account cannot read service principals in Microsoft Entra ID."
+    echo "  Azure CLI: $(echo "$out" | tr '\n' ' ')"
+    echo "  Ask an administrator for directory read access, then rerun."
+    exit 1
+  fi
+  servicePrincipalId="$out"
+  [ -n "$servicePrincipalId" ] && return 0
+
+  # 2. Not in your tenant yet: create it from Lucidity's application.
+  echo "   Lucidity's service principal not found in this tenant; creating it..."
+  if ! out=$(az ad sp create --id "$LUCIDITYAPPID" --query id -o tsv --only-show-errors 2>&1); then
+    echo "ERROR: your account cannot create Lucidity's service principal."
+    echo "  Azure CLI: $(echo "$out" | tr '\n' ' ')"
+    echo "  Ask an Entra administrator (e.g. Application Administrator) to run:"
+    echo "    az ad sp create --id ${LUCIDITYAPPID}"
+    echo "  then rerun this script."
+    exit 1
+  fi
+  servicePrincipalId="$out"
+
+  # 3. Last resort: commands succeeded but returned no ID.
   [ -z "$servicePrincipalId" ] && { echo "ERROR: could not resolve Lucidity SP. Contact Lucidity."; exit 1; }
 }
 
+# Create the role at the scope, or update it in place if it already exists.
 create_or_update_role() {  # $1=roleName $2=scopePath ; echoes roleId on stdout, "" on failure (diagnostics to stderr)
   local rname="$1" scope="$2" rfile rid rerr existing
   rfile="$(mktemp)"
@@ -225,6 +261,8 @@ EOF
   echo "$rid"
 }
 
+# Assign the role to Lucidity with the Blob read condition, replacing any earlier
+# assignment. Retries allow for Azure replication delays after role creation.
 assign_role() {  # $1=roleId $2=scope ; returns 0 ok / 1 fail
   local rid="$1" scope="$2" prior out lasterr
   prior=$(az role assignment list --assignee "$servicePrincipalId" --role "$rid" --scope "$scope" --query "[0].id" -o tsv --only-show-errors 2>/dev/null)
@@ -240,6 +278,9 @@ assign_role() {  # $1=roleId $2=scope ; returns 0 ok / 1 fail
   return 1
 }
 
+# setup_now only: with your credentials, create 'lucidity-inventory' and turn on
+# LAT on each storage account (or those given with -a). Changes your default
+# az subscription as it goes.
 provision_sub() {  # $1=subId ; provisions container + LAT (operator creds). returns 0/1
   local sub="$1" accounts line acct rg exists lat rc=0
   az account set --subscription "$sub" --only-show-errors 2>/dev/null || { echo "     ($sub) WARN: cannot select subscription"; return 1; }
@@ -268,55 +309,23 @@ provision_sub() {  # $1=subId ; provisions container + LAT (operator creds). ret
   return $rc
 }
 
+# Subscriptions under the management group, including nested groups.
 subs_under_mg() {  # $1=mgId ; prints child subscription ids (nested included)
   az account management-group entities list \
     --query "[?type=='/subscriptions' && contains(parentNameChain, '$1')].name" -o tsv --only-show-errors 2>/dev/null
 }
 
-clear_scope() {  # $1=scopePath ; deletes prefix-matching custom roles + their Lucidity assignments
-  local scope="$1" line rname rid asg delerr n=0
-  echo "   scope: $scope  (prefix '${ROLE_PREFIX}')"
-  # list custom roles at this scope whose name starts with prefix
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    rname="${line%%:::*}"; rid="${line##*:::}"
-    n=$((n+1))
-    echo "     - ${rname}"
-    # remove Lucidity SP assignments to this role, wherever they are
-    for asg in $(az role assignment list --all --assignee "$servicePrincipalId" --role "$rid" --query "[].id" -o tsv --only-show-errors 2>/dev/null); do
-      az role assignment delete --ids "$asg" --only-show-errors >/dev/null 2>&1 && echo "         removed assignment"
-    done
-    delerr=$(az role definition delete --name "$rid" --scope "$scope" 2>&1)
-    if [ $? -eq 0 ]; then echo "         deleted role definition"
-    else echo "         DELETE FAILED: $(echo "$delerr" | tr '\n' ' ' | sed 's/  */ /g')"; fi
-  done < <(az role definition list --scope "$scope" --custom-role-only true \
-            --query "[?starts_with(roleName, '${ROLE_PREFIX}')].[roleName,name]" -o tsv --only-show-errors 2>/dev/null | sed 's/\t/:::/')
-  [ "$n" -eq 0 ] && echo "     (no matching roles found at this scope)"
-}
-
-# ---- Login + SP ------------------------------------------------------------
+# ---- Azure CLI + login + SP ------------------------------------------------
+command -v az >/dev/null 2>&1 || { echo "ERROR: Azure CLI (az) not found. Install it, or run this script in Azure Cloud Shell."; exit 1; }
 echo ">> Ensuring Azure CLI login..."
-az account show >/dev/null 2>&1 || az login --only-show-errors >/dev/null
+az account show >/dev/null 2>&1 || az login --only-show-errors >/dev/null || { echo "ERROR: Azure CLI login failed."; exit 1; }
 tenantId=$(az account show --query tenantId -o tsv --only-show-errors)
 echo ">> Resolving Lucidity service principal..."
 resolve_sp
 echo "   Service Principal Id: $servicePrincipalId"
 
-# ---- CLEAR mode ------------------------------------------------------------
-if [ "$DO_CLEAR" = "true" ]; then
-  echo ""
-  echo "=============================================================="
-  echo " CLEAR - delete custom roles with prefix '${ROLE_PREFIX}'"
-  echo "   Scope mode : ${MODE}   targets: ${SCOPE_LIST[*]}"
-  echo "   Also removes Lucidity SP (${servicePrincipalId}) assignments to them"
-  echo "=============================================================="
-  if [ "$ASSUME_YES" != "true" ]; then printf "Proceed with deletion? [y/N] "; read -r r; case "$r" in y|Y|yes|YES) ;; *) echo "Aborted."; exit 0 ;; esac; fi
-  for id in "${SCOPE_LIST[@]}"; do clear_scope "$(scope_path "$MODE" "$id")"; done
-  echo ">> Clear complete."
-  exit 0
-fi
-
 # ---- Consequence banner + confirm ------------------------------------------
+# Shows what will change and asks before proceeding (-y skips the prompt).
 echo ""
 echo "=============================================================="
 echo " About to apply (mode: ${ENABLEMENT_MODE})"
@@ -334,6 +343,8 @@ echo "=============================================================="
 if [ "$ASSUME_YES" != "true" ]; then printf "Proceed? [y/N] "; read -r r; case "$r" in y|Y|yes|YES) ;; *) echo "Aborted."; exit 0 ;; esac; fi
 
 # ---- Main loop -------------------------------------------------------------
+# Per scope: create/update the role, then assign it on each subscription. A
+# failure is reported and the run continues; the exit code is non-zero at the end.
 fail=0
 for id in "${SCOPE_LIST[@]}"; do
   scope="$(scope_path "$MODE" "$id")"
@@ -348,7 +359,8 @@ for id in "${SCOPE_LIST[@]}"; do
   fi
   echo "   role id: $roleId"
 
-  # Assignments are ALWAYS at subscription scope. For MG mode, fan out to child subs.
+  # Assignments are always at subscription scope: Azure doesn't allow a role with
+  # Blob data permissions to be assigned at a management group.
   if [ "$MODE" = "mg" ]; then
     target_subs="$(subs_under_mg "$id")"
     [ -z "$target_subs" ] && echo "   (no child subscriptions enumerated - check MG-reader access)"
