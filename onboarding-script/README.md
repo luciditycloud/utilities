@@ -215,9 +215,17 @@ rather Lucidity hold no write permissions at all, use `setup_now` or
 ## Removing access (`teardown.sh`)
 
 `teardown.sh` replaces the old `--clear` flag of `read-only.sh`. At each scope
-you give it, it deletes every custom role whose name starts with the prefix,
-after first removing Lucidity's assignments to it. With `-m`, assignments are
-removed from every subscription under the management group.
+you give it, it finds every custom role whose name starts with the prefix and
+Lucidity's assignments to it (with `-m`, on every subscription under the
+management group), lists them, then asks for approval before each step:
+
+1. **Remove Lucidity's role assignments.**
+2. **Delete the role definitions.** Azure won't delete a role that is still
+   assigned, so if step 1 was skipped or partly failed, the script warns you
+   before asking.
+
+Answering no at a step skips it; nothing is changed before the first approval.
+`-y` approves both steps without prompting.
 
 ```bash
 chmod +x teardown.sh
@@ -231,7 +239,7 @@ chmod +x teardown.sh
 | `-m "<mgIds>"` | — | Management group id(s), comma- or space-separated. Exactly one of `-m` / `-s` is required. |
 | `-s "<subIds>"` | — | Subscription id(s), comma- or space-separated. Exactly one of `-m` / `-s` is required. |
 | `-p <prefix>` | `lucidity-permissions-readonly` | Role-name prefix used at onboarding. |
-| `-y`, `--yes` | off | Skip the `Proceed with deletion? [y/N]` prompt. |
+| `-y`, `--yes` | off | Approve both steps without prompting — for unattended runs. |
 | `-h`, `--help` | — | Show usage. |
 
 It does **not** remove the `lucidity-inventory` containers, Last Access Time

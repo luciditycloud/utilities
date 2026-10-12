@@ -2,10 +2,14 @@
 # =============================================================================
 # Lucidity - remove read-only assessment access
 # -----------------------------------------------------------------------------
-# Reverses read-only.sh. At each scope given, deletes every custom role whose
-# name starts with the prefix, after first removing Lucidity's assignments to it.
+# Reverses read-only.sh. At each scope given, finds every custom role whose
+# name starts with the prefix, and Lucidity's assignments to it. It then asks
+# for approval before each step:
+#   1. Remove Lucidity's role assignments.
+#   2. Delete the role definitions.
+# Answering "no" at a step skips it. Nothing changes before the first approval.
 #
-#   -m "<mgIds>"   management group(s); assignments are removed from every
+#   -m "<mgIds>"   management group(s); assignments are looked up on every
 #                  subscription under each group
 #   -s "<subIds>"  subscription(s)
 #   IDs may be comma- or space-separated. Provide exactly one of -m / -s.
@@ -41,7 +45,7 @@ usage() {
   echo "  -m  management group ids"
   echo "  -s  subscription ids"
   echo "  -p  role-name prefix used at onboarding (default: ${ROLE_PREFIX})"
-  echo "  -y, --yes     skip confirmation"
+  echo "  -y, --yes     approve every step without prompting"
   echo "  IDs may be comma- or space-separated. Provide exactly one of -m / -s."
   exit 1
 }
@@ -77,49 +81,14 @@ subs_under_mg() {  # $1=mgId
     --query "[?type=='/subscriptions' && contains(parentNameChain, '$1')].name" -o tsv --only-show-errors 2>/dev/null
 }
 
-fail=0
+oneline() { echo "$1" | tr '\n' ' ' | sed 's/  */ /g'; }
 
-# Remove Lucidity's assignments of one role anywhere in one subscription.
-remove_assignments() {  # $1=roleId $2=subId
-  local rid="$1" sub="$2" asg
-  for asg in $(az role assignment list --all --subscription "$sub" --assignee "$servicePrincipalId" \
-                 --role "$rid" --query "[].id" -o tsv --only-show-errors 2>/dev/null); do
-    if az role assignment delete --ids "$asg" --only-show-errors >/dev/null; then
-      echo "         removed assignment in subscription $sub"
-    else
-      echo "         FAILED to remove assignment in subscription $sub"; fail=1
-    fi
-  done
-}
-
-# Delete every prefix-matching custom role at one scope, after removing
-# Lucidity's assignments to it. Azure refuses to delete a role still assigned.
-clear_scope() {  # $1=mg|sub  $2=id
-  local scope line rname rid delerr subs sub n=0
-  scope="$(scope_path "$1" "$2")"
-  if [ "$1" = "mg" ]; then
-    subs="$(subs_under_mg "$2")"
-    [ -z "$subs" ] && echo "   (no child subscriptions enumerated for $2 - check management-group Reader access)"
-  else
-    subs="$2"
-  fi
-  echo "   scope: $scope  (prefix '${ROLE_PREFIX}')"
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    rname="${line%%:::*}"; rid="${line##*:::}"
-    n=$((n+1))
-    echo "     - ${rname}"
-    if [ -n "$servicePrincipalId" ]; then
-      for sub in $subs; do remove_assignments "$rid" "$sub"; done
-    fi
-    if delerr=$(az role definition delete --name "$rid" --scope "$scope" 2>&1); then
-      echo "         deleted role definition"
-    else
-      echo "         DELETE FAILED: $(echo "$delerr" | tr '\n' ' ' | sed 's/  */ /g')"; fail=1
-    fi
-  done < <(az role definition list --scope "$scope" --custom-role-only true \
-            --query "[?starts_with(roleName, '${ROLE_PREFIX}')].[roleName,name]" -o tsv --only-show-errors 2>/dev/null | sed 's/\t/:::/')
-  [ "$n" -eq 0 ] && echo "     (no matching roles found at this scope)"
+# Approval gate: returns 0 if approved (always, with -y).
+approve() {  # $1=question
+  [ "$ASSUME_YES" = "true" ] && return 0
+  local r
+  printf "%s [y/N] " "$1"; read -r r
+  case "$r" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
 # ---- Azure CLI + login + SP ------------------------------------------------
@@ -131,24 +100,104 @@ az account show >/dev/null 2>&1 || az login --only-show-errors >/dev/null || { e
 echo ">> Looking up Lucidity service principal..."
 if ! servicePrincipalId=$(az ad sp list --filter "appId eq '${LUCIDITYAPPID}'" --query "[0].id" -o tsv --only-show-errors 2>&1); then
   echo "ERROR: your account cannot read service principals in Microsoft Entra ID."
-  echo "  Azure CLI: $(echo "$servicePrincipalId" | tr '\n' ' ')"
+  echo "  Azure CLI: $(oneline "$servicePrincipalId")"
   echo "  Ask an administrator for directory read access, then rerun."
   exit 1
 fi
 if [ -n "$servicePrincipalId" ]; then
   echo "   Service Principal Id: $servicePrincipalId"
 else
-  echo "   Not found in this tenant; only role definitions will be deleted."
+  echo "   Not found in this tenant; there are no Lucidity assignments to remove."
 fi
 
-# ---- Confirm + clear -------------------------------------------------------
+# ---- Discovery (no changes) ------------------------------------------------
+# Parallel lists of what was found: roles, and Lucidity's assignments to them.
+R_ID=(); R_NAME=(); R_SCOPE=()
+A_ID=(); A_ROLE=(); A_SUB=()
+warn=0
+
+echo ">> Finding roles with prefix '${ROLE_PREFIX}' and Lucidity's assignments to them..."
+for id in "${SCOPE_LIST[@]}"; do
+  scope="$(scope_path "$MODE" "$id")"
+  if [ "$MODE" = "mg" ]; then
+    subs="$(subs_under_mg "$id")"
+    [ -z "$subs" ] && { echo "   WARN: no child subscriptions enumerated for $id - check management-group Reader access."; warn=1; }
+  else
+    subs="$id"
+  fi
+
+  if ! roles=$(az role definition list --scope "$scope" --custom-role-only true \
+         --query "[?starts_with(roleName, '${ROLE_PREFIX}')].[roleName,name]" -o tsv --only-show-errors 2>&1); then
+    echo "   WARN: could not list roles at $scope: $(oneline "$roles")"; warn=1; continue
+  fi
+
+  while IFS=$'\t' read -r rname rid; do
+    [ -z "$rid" ] && continue
+    R_ID+=("$rid"); R_NAME+=("$rname"); R_SCOPE+=("$scope")
+    [ -z "$servicePrincipalId" ] && continue
+    for sub in $subs; do
+      if ! asgs=$(az role assignment list --all --subscription "$sub" --assignee "$servicePrincipalId" \
+             --role "$rid" --query "[].id" -o tsv --only-show-errors 2>&1); then
+        echo "   WARN: could not list assignments of $rname in subscription $sub: $(oneline "$asgs")"; warn=1; continue
+      fi
+      for asg in $asgs; do A_ID+=("$asg"); A_ROLE+=("$rname"); A_SUB+=("$sub"); done
+    done
+  done <<< "$roles"
+done
+
 echo ""
 echo "=============================================================="
-echo " Remove Lucidity custom roles with prefix '${ROLE_PREFIX}'"
-echo "   Scope mode : ${MODE}   targets: ${SCOPE_LIST[*]}"
-echo "   Lucidity's assignments to these roles are removed first"
+echo " Found (scope mode: ${MODE}, targets: ${SCOPE_LIST[*]})"
+echo "   Roles       : ${#R_ID[@]}"
+for i in "${!R_ID[@]}"; do echo "     - ${R_NAME[$i]}  (${R_SCOPE[$i]})"; done
+echo "   Assignments : ${#A_ID[@]}"
+for i in "${!A_ID[@]}"; do echo "     - ${A_ROLE[$i]}  in subscription ${A_SUB[$i]}"; done
 echo "=============================================================="
-if [ "$ASSUME_YES" != "true" ]; then printf "Proceed with deletion? [y/N] "; read -r r; case "$r" in y|Y|yes|YES) ;; *) echo "Aborted."; exit 0 ;; esac; fi
-for id in "${SCOPE_LIST[@]}"; do clear_scope "$MODE" "$id"; done
-[ "$fail" -eq 0 ] && echo ">> Teardown complete." || echo ">> Teardown completed with errors - review above."
-exit $fail
+[ "$warn" -ne 0 ] && echo "WARNING: some lookups failed (see WARN lines above); this list may be incomplete."
+
+if [ "${#R_ID[@]}" -eq 0 ]; then
+  echo ">> Nothing to remove."
+  exit "$warn"
+fi
+
+fail=0
+
+# ---- Step 1: role assignments ----------------------------------------------
+remaining=${#A_ID[@]}   # assignments still in place after this step
+if [ "$remaining" -gt 0 ]; then
+  echo ""
+  if approve "Step 1/2: remove ${#A_ID[@]} Lucidity role assignment(s)?"; then
+    for i in "${!A_ID[@]}"; do
+      if out=$(az role assignment delete --ids "${A_ID[$i]}" --only-show-errors 2>&1); then
+        echo "   removed: ${A_ROLE[$i]} in subscription ${A_SUB[$i]}"
+        remaining=$((remaining - 1))
+      else
+        echo "   FAILED: ${A_ROLE[$i]} in subscription ${A_SUB[$i]}: $(oneline "$out")"; fail=1
+      fi
+    done
+  else
+    echo "   Step 1 skipped."
+  fi
+fi
+
+# ---- Step 2: role definitions ----------------------------------------------
+# Azure refuses to delete a role that is still assigned.
+echo ""
+[ "$remaining" -gt 0 ] &&
+  echo "Note: $remaining Lucidity assignment(s) are still in place; deleting their roles will fail."
+if approve "Step 2/2: delete ${#R_ID[@]} role definition(s)?"; then
+  for i in "${!R_ID[@]}"; do
+    if out=$(az role definition delete --name "${R_ID[$i]}" --scope "${R_SCOPE[$i]}" 2>&1); then
+      echo "   deleted: ${R_NAME[$i]}"
+    else
+      echo "   FAILED: ${R_NAME[$i]}: $(oneline "$out")"; fail=1
+    fi
+  done
+else
+  echo "   Step 2 skipped."
+fi
+
+echo ""
+if [ "$fail" -eq 0 ] && [ "$warn" -eq 0 ]; then echo ">> Teardown complete."
+else echo ">> Teardown finished with errors or warnings - review above."; fi
+[ "$fail" -eq 0 ] && [ "$warn" -eq 0 ]
