@@ -20,7 +20,8 @@ AUTO_APPROVE_NETWORK_CHANGES=false
 STORAGE_ACCOUNTS=""   # names, comma- or space-separated; empty = all in the subscription
 
 # ---------- Lucidity network details (provided by Lucidity) ----------
-LUCIDITY_REGION="eastus"
+# Every storage account whose firewall allows only selected networks gets
+# both a subnet rule and an IP rule for Lucidity.
 
 # Lucidity's outbound public IP(s). SUBJECT TO CHANGE: the current IP is
 # expected to change around LUCIDITY_EGRESS_IPS_VALID_UNTIL. When it changes,
@@ -30,10 +31,11 @@ LUCIDITY_EGRESS_IPS="4.157.111.90"
 LUCIDITY_EGRESS_IPS_VALID_UNTIL="2026-11-16"
 LUCIDITY_RETIRED_EGRESS_IPS=""
 
-# Lucidity's AKS subnet. Subnet rules take effect only once this subnet has a
-# Microsoft.Storage service endpoint, so they are skipped until then.
+# Lucidity's AKS subnet. It has a Regional Microsoft.Storage service endpoint.
+# Once the Global endpoint replaces it, subnet rules cover every region: then
+# empty LUCIDITY_EGRESS_IPS and move its IPs to LUCIDITY_RETIRED_EGRESS_IPS,
+# so a rerun removes the IP rules.
 LUCIDITY_SUBNET_IDS="/subscriptions/3511ac94-c2ef-4644-8147-55f5f9a27a9e/resourceGroups/azurepls-rg/providers/Microsoft.Network/virtualNetworks/azurepls-vnet/subnets/aks-subnet"
-LUCIDITY_SERVICE_ENDPOINT_ENABLED=false
 
 # ---------- Preflight ----------
 for cmd in az jq; do
@@ -107,11 +109,9 @@ finish() {
     --argjson blobs "$BLOBS" \
     --argjson blobVisibility "$BLOB_VISIBILITY" \
     --argjson networkChecked "$network_checked" \
-    --arg lucidityRegion "$LUCIDITY_REGION" \
     --arg egressIps "$LUCIDITY_EGRESS_IPS" \
     --arg retiredEgressIps "$LUCIDITY_RETIRED_EGRESS_IPS" \
     --arg subnetIds "$LUCIDITY_SUBNET_IDS" \
-    --argjson serviceEndpoint "$LUCIDITY_SERVICE_ENDPOINT_ENABLED" \
     --slurpfile storage "$STORAGE_FILE" \
     'def list: split("[ ,]+"; null) | map(select(length > 0));
     {
@@ -131,11 +131,9 @@ finish() {
                else "completed" end),
       steps: .,
       storageNetwork: (if $networkChecked then {
-        lucidityRegion: $lucidityRegion,
         lucidityEgressIps: ($egressIps | list),
         retiredEgressIps: ($retiredEgressIps | list),
         luciditySubnetIds: ($subnetIds | list),
-        serviceEndpointEnabled: $serviceEndpoint,
         accounts: $storage
       } else null end)
     }' "$STEPS_FILE")
@@ -477,11 +475,13 @@ fi
 
 # ---------- Storage network access ----------
 # Lucidity reads blob inventory over the storage data plane, which a storage
-# firewall can block. Lucidity's network tests (outbound via load balancer):
-#   - Accounts in LUCIDITY_REGION see Lucidity's private IP, so IP rules never
-#     work there. They need a subnet rule, which needs Lucidity's service
-#     endpoint.
-#   - Accounts in other regions see Lucidity's public IP, so an IP rule works.
+# firewall can block. Lucidity's network tests (outbound via load balancer,
+# Regional service endpoint):
+#   - Accounts in Lucidity's region (and possibly its paired region) see
+#     Lucidity's subnet, so the subnet rule applies.
+#   - Accounts in other regions see Lucidity's public IP, so the IP rule
+#     applies.
+# Adding both to every firewalled account covers either case.
 # Only Lucidity's own rules are added or removed. defaultAction and
 # publicNetworkAccess are never changed. Uses your credentials, not Lucidity's.
 
@@ -499,8 +499,6 @@ network_note() {
       echo "Public network access is disabled. Allow selected networks and rerun, or ask Lucidity about a private endpoint." ;;
     network_perimeter)
       echo "Secured by a network security perimeter. Add Lucidity to the perimeter's access rules." ;;
-    unreachable_until_service_endpoint)
-      echo "Same region as Lucidity ($LUCIDITY_REGION): reachable only once Lucidity enables its service endpoint. No action needed from you now." ;;
     not_found)
       echo "Not found in this subscription. Check the name in STORAGE_ACCOUNTS." ;;
     *)
@@ -520,10 +518,6 @@ check_storage_network() {
       "LUCIDITY_EGRESS_IPS was due to change on $LUCIDITY_EGRESS_IPS_VALID_UNTIL; IP rules may be outdated."
     echo "WARNING: Lucidity's outbound IP was due to change on $LUCIDITY_EGRESS_IPS_VALID_UNTIL." >&2
     echo "  Get the latest script from Lucidity before approving IP rules." >&2
-  fi
-
-  if [[ "$LUCIDITY_SERVICE_ENDPOINT_ENABLED" != true && -n "$LUCIDITY_SUBNET_IDS" ]]; then
-    echo "WARNING: Lucidity's service endpoint is not enabled yet, so subnet rules are skipped." >&2
   fi
 
   progress "Listing storage accounts and their firewall settings..."
@@ -546,19 +540,15 @@ check_storage_network() {
     --argjson wanted "$(to_json_list "$STORAGE_ACCOUNTS")" \
     --argjson ips "$(to_json_list "$LUCIDITY_EGRESS_IPS")" \
     --argjson retired "$(to_json_list "$LUCIDITY_RETIRED_EGRESS_IPS")" \
-    --argjson subnets "$(to_json_list "$LUCIDITY_SUBNET_IDS")" \
-    --argjson se "$LUCIDITY_SERVICE_ENDPOINT_ENABLED" \
-    --arg region "$LUCIDITY_REGION" '
+    --argjson subnets "$(to_json_list "$LUCIDITY_SUBNET_IDS")" '
     def has_ip($a; $ip): ($a.ipRules // []) | any(. == $ip or . == ($ip + "/32"));
     def has_subnet($a; $s): ($a.vnetRules // []) | any(ascii_downcase == ($s | ascii_downcase));
     def ip_adds($a): [$ips[] | select(has_ip($a; .) | not) | {op: "add", type: "ip", value: .}];
     def ip_removals($a): [$retired[] | select(has_ip($a; .)) | {op: "remove", type: "ip", value: .}];
     def subnet_adds($a):
-      if $se then [$subnets[] | select(has_subnet($a; .) | not) | {op: "add", type: "subnet", value: .}]
-      else [] end;
+      [$subnets[] | select(has_subnet($a; .) | not) | {op: "add", type: "subnet", value: .}];
     def classify:
       . as $a
-      | (($a.location // "" | ascii_downcase) == ($region | ascii_downcase)) as $same
       | {name, resourceGroup, location, kind,
          publicNetworkAccess: (.publicNetworkAccess // "Enabled"),
          defaultAction: (.defaultAction // "Allow")} as $base
@@ -566,10 +556,8 @@ check_storage_network() {
         elif $base.publicNetworkAccess == "Disabled" then $base + {status: "public_access_disabled", actions: []}
         elif $base.publicNetworkAccess == "SecuredByPerimeter" then $base + {status: "network_perimeter", actions: []}
         elif $base.defaultAction == "Allow" then $base + {status: "open", actions: []}
-        elif $same and ($se | not) then
-          $base + {status: "unreachable_until_service_endpoint", actions: ip_removals($a)}
         else
-          ((if $same then [] else ip_adds($a) end) + subnet_adds($a) + ip_removals($a)) as $actions
+          (subnet_adds($a) + ip_adds($a) + ip_removals($a)) as $actions
           | $base + {status: (if $actions == [] then "already_allowed" else "needs_rule" end),
                      actions: $actions}
         end;
@@ -631,8 +619,7 @@ check_storage_network() {
   done < <(jq -c '.[]' <<< "$plan")
 
   attention=$(jq -sc '[.[] | select(
-      (.status | IN("public_access_disabled", "network_perimeter",
-                    "unreachable_until_service_endpoint", "not_found"))
+      (.status | IN("public_access_disabled", "network_perimeter", "not_found"))
       or (.result | IN("pending_approval", "failed")))]' "$STORAGE_FILE")
 
   if [[ "$(jq length <<< "$attention")" -eq 0 ]]; then

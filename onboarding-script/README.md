@@ -97,16 +97,19 @@ permissions are unaffected.
 ## Storage network check
 
 Lucidity reads the blob inventory reports over the network. If a storage
-account's firewall allows only selected networks, Lucidity needs a rule
-allowing its traffic. The script checks every storage account (or those in
-`STORAGE_ACCOUNTS`) and gives each one a status:
+account's firewall allows only selected networks, Lucidity needs rules
+allowing its traffic: a **subnet rule** for Lucidity's subnet and an **IP
+rule** for Lucidity's outbound IP. Which one Azure uses depends on the
+account's region, so both are added to every such account.
+
+The script checks every storage account (or those in `STORAGE_ACCOUNTS`) and
+gives each one a status:
 
 | Status | Meaning | What happens |
 |---|---|---|
 | `open` | Firewall allows all networks | Nothing needed |
-| `already_allowed` | Lucidity's rule is already in place | Nothing needed |
-| `needs_rule` | Firewall is on and Lucidity's rule is missing | The rule is added, after your approval |
-| `unreachable_until_service_endpoint` | Firewall is on and the account is in the same region as Lucidity (East US) | Nothing you can do yet; this will start working once Lucidity enables its service endpoint |
+| `already_allowed` | Lucidity's rules are already in place | Nothing needed |
+| `needs_rule` | Firewall allows selected networks and a Lucidity rule is missing | The missing rules are added, after your approval |
 | `public_access_disabled` | Public network access is disabled | Manual: allow selected networks and rerun, or ask Lucidity about a private endpoint |
 | `network_perimeter` | Secured by a network security perimeter | Manual: add Lucidity to the perimeter's access rules |
 | `not_applicable` | File-share-only account | Nothing needed |
@@ -166,11 +169,51 @@ that change on Lucidity's side:
   `LUCIDITY_EGRESS_IPS_VALID_UNTIL`. A customer rerun then adds the new rule
   and removes the old one. After the valid-until date, runs warn that the IP
   may be outdated.
-- **Service endpoint goes live:** set `LUCIDITY_SERVICE_ENDPOINT_ENABLED=true`.
-  The script then adds the subnet rule (`LUCIDITY_SUBNET_IDS`) to every
-  account with a firewall, including East US accounts, and keeps the IP rule
-  for accounts in other regions. Until then, subnet rules are skipped with a
-  warning.
+- **Service endpoint:** Lucidity's subnet (`LUCIDITY_SUBNET_IDS`) has a
+  Regional `Microsoft.Storage` service endpoint. With Lucidity's
+  load-balancer outbound, accounts in Lucidity's region (and possibly its
+  paired region) see the subnet, and accounts elsewhere see the public IP.
+  So every firewalled account gets both rules.
+- **Global service endpoint goes live:** every region then sees the subnet,
+  and IP rules stop working. Set `LUCIDITY_EGRESS_IPS=""` and move its IPs to
+  `LUCIDITY_RETIRED_EGRESS_IPS`. A customer rerun then removes the IP rules
+  and keeps the subnet rule. No code change is needed.
+
+## Open items
+
+Known gaps and decisions still pending (as of 2026-10-22):
+
+**Decisions**
+- Whether Run Command and the inventory policy write/delete permissions
+  belong in the default setup, and whether the write and delete permissions
+  granted by default (`AUTOSCALER`, `BLOBS`) should be opt-in.
+- Support for management groups and several subscriptions per run; the
+  script handles one subscription.
+- Whether disabled or warned subscriptions should be skipped.
+
+**Backend team**
+- Confirm nothing in Lucidity needs to read or list blobs outside
+  `lucidity-inventory`; the condition on the assignments blocks it.
+- Detect a missing Reservations Reader on Lucidity's side (for example, a
+  403 from the reservations API), rather than relying on customers sending
+  the report.
+
+**Scheduled changes**
+- Lucidity's outbound IP changes around 2026-11-16: update
+  `LUCIDITY_EGRESS_IPS`, move the old IP to `LUCIDITY_RETIRED_EGRESS_IPS`,
+  and update `LUCIDITY_EGRESS_IPS_VALID_UNTIL`.
+- Global service endpoint: switch over as described above.
+
+**Script gaps**
+- Customers onboarded by an earlier version have assignments without the
+  `lucidity-inventory` condition, and a rerun doesn't add it.
+- No teardown script for this version.
+
+**Not yet tested in real Azure**
+- Subnet rules, including a customer storage account in a different tenant
+  from Lucidity's subnet.
+- Running without a terminal, and `AUTO_APPROVE_NETWORK_CHANGES=true`.
+- The shorter console output for a failed Reservations Reader assignment.
 
 ## Previous version
 
