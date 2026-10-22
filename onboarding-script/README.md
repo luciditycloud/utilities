@@ -1,17 +1,24 @@
 # read-only.sh
 
-A bash + Azure CLI script that onboards an Azure subscription to Lucidity.
+A bash + Azure CLI script that onboards Azure subscriptions to Lucidity.
 It assigns built-in and custom roles to Lucidity's service principal, checks
 whether your storage firewalls will let Lucidity read blob inventory, and
 writes a report for you to send to Lucidity.
 
-It has two modes:
+You choose **where** to onboard:
+
+- **Subscriptions**: one or more subscription IDs.
+- **Management groups**: one or more management group IDs. Every enabled
+  subscription under each group is onboarded, including those in nested
+  groups.
+
+And **what** Lucidity gets:
 
 - **Optimization** (default): read access, plus write and delete
   permissions on resources such as disks, snapshots and VMs, so Lucidity can
   act on its recommendations. The script asks you to approve this before it
   changes anything.
-- **Assessment**: read access, plus the data collection Lucidity needs to
+- **Visibility**: read access, plus the data collection Lucidity needs to
   project your savings. No write or delete permissions on your resources,
   and no approval prompt.
 
@@ -21,9 +28,12 @@ See [What it grants](#what-it-grants) for the details.
 
 - **Azure CLI**, logged in (`az login`), and **jq**. Azure Cloud Shell has
   both.
-- Your account needs, on the subscription:
-  - **Owner**, or **User Access Administrator** plus permission to create
-    custom role definitions, to create the roles and assignments.
+- Your account needs:
+  - **Subscriptions:** Owner on each subscription, or User Access
+    Administrator plus permission to create custom role definitions.
+  - **Management groups:** the same, **at the management group**.
+    Subscription-level Owner isn't enough to create a role at a management
+    group. You also need to be able to see the group's subscriptions.
   - **Owner or Contributor** on storage accounts, if you approve storage
     firewall changes.
 - **Optional:** assigning *Reservations Reader* needs tenant-level rights
@@ -41,18 +51,25 @@ wget https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/main/o
 chmod +x read-only.sh
 ```
 
-Edit the settings at the top of the file. At minimum, set
-`SUBSCRIPTION_ID` and `SP_OBJECT_ID`:
+Edit the settings at the top of the file. At minimum, set where to onboard
+and Lucidity's service principal:
 
 ```bash
-SUBSCRIPTION_ID="<subscription-id>"
+# Subscriptions
+SCOPE_TYPE="subscription"
+SCOPE_IDS="<subscription-id-1>, <subscription-id-2>"
+
+# or management groups
+SCOPE_TYPE="management_group"
+SCOPE_IDS="<management-group-id>"
+
 SP_OBJECT_ID="<service-principal-object-id>"
 ```
 
-For assessment mode, also set:
+For visibility mode, also set:
 
 ```bash
-MODE="assessment"
+MODE="visibility"
 ```
 
 Then run it:
@@ -61,26 +78,33 @@ Then run it:
 ./read-only.sh
 ```
 
-In optimization mode, the script first lists the optimization features and
-asks `Grant optimization access? [y/N]`. Only `y` or `yes` continues;
-anything else stops the script before it changes anything. For unattended
-runs, set `AUTO_APPROVE_OPTIMIZATION=true`.
+The script first lists the subscriptions it found and which it will skip.
+In optimization mode it then lists the optimization features and asks
+`Grant optimization access? [y/N]`. Only `y` or `yes` continues; anything
+else stops the script before it changes anything. A run asks at most two
+questions, this one and the storage firewall one, whatever the number of
+subscriptions. For unattended runs, set `AUTO_APPROVE_OPTIMIZATION=true`
+and `AUTO_APPROVE_NETWORK_CHANGES=true`.
 
-You can move from assessment to optimization later by rerunning with
-`MODE="optimization"`. Rerunning in assessment mode does not remove
-optimization access granted earlier; the script reports it instead.
+Rerunning is safe: existing roles and assignments are updated in place.
 
-The script handles one subscription per run. For several subscriptions,
-change `SUBSCRIPTION_ID` and run it again for each. Rerunning on the same
-subscription is safe: roles are updated in place.
+- **Moving from visibility to optimization:** rerun with
+  `MODE="optimization"`. Rerunning in visibility mode does not remove
+  optimization access granted earlier; the script reports it instead.
+- **New subscriptions under a management group** aren't onboarded
+  automatically. Rerun the script after adding them.
+
+Output is coloured in a terminal. Set `NO_COLOR=1` to turn colours off;
+they're off automatically when the output isn't a terminal.
 
 ## Settings
 
 | Setting | Default | What it does |
 |---|---|---|
-| `SUBSCRIPTION_ID` | — | Subscription to onboard (required) |
+| `SCOPE_TYPE` | `subscription` | `subscription` or `management_group` |
+| `SCOPE_IDS` | — | Subscription or management group IDs, comma- or space-separated (required) |
 | `SP_OBJECT_ID` | — | Lucidity's service principal object ID (required) |
-| `MODE` | `optimization` | `optimization` or `assessment` |
+| `MODE` | `optimization` | `optimization` or `visibility` |
 | `AUTO_APPROVE_OPTIMIZATION` | `false` | Grant optimization access without asking |
 | `AUTOSCALER` | `true` | Disk autoscaling permissions (optimization only) |
 | `IDLE_DISK` | `false` | Idle disk permissions (optimization only) |
@@ -90,36 +114,56 @@ subscription is safe: roles are updated in place.
 | `BLOB_VISIBILITY` | `true` | Blob inventory permissions, so Lucidity can see your blob storage (both modes) |
 | `STORAGE_NETWORK_CHECK` | `true` | Check storage firewalls (when `BLOBS` or `BLOB_VISIBILITY` is on) |
 | `AUTO_APPROVE_NETWORK_CHANGES` | `false` | Add the firewall rules without asking |
-| `STORAGE_ACCOUNTS` | empty | Limit the firewall check to these accounts (comma- or space-separated); empty means all |
+| `STORAGE_ACCOUNTS` | empty | Limit the firewall check to these accounts (comma- or space-separated); empty means all in the target subscriptions |
 
 The settings under *Lucidity network details* are provided by Lucidity.
 Don't change them unless Lucidity asks you to.
 
 ## What it grants
 
-All assignments are on the subscription, except Reservations Reader.
-
-| Role | Purpose | Assessment | Optimization |
+| Role | Purpose | Visibility | Optimization |
 |---|---|---|---|
 | **Reader** (built-in) | Read all resource configuration | ✅ | ✅ |
-| **Reservations Reader** (built-in), at `/providers/Microsoft.Capacity` | Read Azure reservations (optional) | ✅ attempted | ✅ attempted |
-| `lucidity-guest-insights-role-<sub>` | With `GUEST_INSIGHTS`: run the Lucidity collector inside VMs and scale-set instances (Run Command). With `BLOB_VISIBILITY`: manage blob inventory policies, the inventory container and last-access tracking; read blob data | ✅ | ✅ |
-| `lucidity-optimize-role-<sub>` | Write and delete permissions for the selected optimization features | ❌ | ✅ when any of `AUTOSCALER`, `IDLE_DISK`, `DISK_TIERING`, `BLOBS` is on |
+| **Reservations Reader** (built-in), at `/providers/Microsoft.Capacity` | Read Azure reservations (optional, tenant-wide) | ✅ attempted | ✅ attempted |
+| `lucidity-guest-insights-role-<id>` | With `GUEST_INSIGHTS`: run the Lucidity collector inside VMs and scale-set instances (Run Command). With `BLOB_VISIBILITY`: manage blob inventory policies, the inventory container and last-access tracking; read blob data | ✅ | ✅ |
+| `lucidity-optimize-role-<id>` | Write and delete permissions for the selected optimization features | ❌ | ✅ when any of `AUTOSCALER`, `IDLE_DISK`, `DISK_TIERING`, `BLOBS` is on |
+
+**Where the roles live:**
+
+- **Subscriptions:** each subscription gets its own custom roles, named
+  after the subscription ID.
+- **Management groups:** the custom roles are created once at each
+  management group and named after it. They're assigned on every enabled
+  subscription under it; Azure doesn't allow roles with blob data
+  permissions to be assigned at the management group itself.
+- **A subscription that already has its own Lucidity roles** (from an
+  earlier subscription-level run) keeps them in a management group run.
+  They're updated in place and the management group's roles aren't added
+  there, so nothing is removed or duplicated.
+- All assignments are on subscriptions, except Reservations Reader.
+
+**Updates only ever add permissions.** On a rerun, permissions missing from
+an existing role are added; permissions already in it are kept, even ones
+the current settings don't ask for. For example, setting
+`GUEST_INSIGHTS=false` on a rerun doesn't take Run Command away. To remove
+access, do it deliberately in Azure. The report lists what was added and
+kept.
 
 The guest insights role isn't created if both `GUEST_INSIGHTS` and
-`BLOB_VISIBILITY` are off.
+`BLOB_VISIBILITY` are off. It's for inspection; the optimize role is for
+changing resources. Keeping them apart lets you grant one without the
+other.
 
-The guest insights role is for inspection; the optimize role is for changing
-resources. Keeping them apart lets you grant one without the other.
-
-**Blob data reads are limited to the `lucidity-inventory` container.** Each
-custom role assignment that includes blob read carries an Azure ABAC
+**Blob data reads are limited to the `lucidity-inventory` container.**
+Azure's blob inventory, set up by Lucidity, writes reports listing each
+blob's properties, including its last access time, into that container.
+Each custom role assignment that includes blob read carries an Azure ABAC
 condition that denies blob reads in any other container. The role's other
 permissions are unaffected.
 
-> **Known limitation:** if a role was assigned by an earlier version of this
-> script without the condition, rerunning does not add it. Lucidity will
-> help you update those assignments.
+**Skipped subscriptions:** subscriptions that aren't enabled (for example
+disabled or warned), or that your account can't see, are skipped and
+listed in the report.
 
 ## Storage network check
 
@@ -129,8 +173,8 @@ allowing its traffic: a **subnet rule** for Lucidity's subnet and an **IP
 rule** for Lucidity's outbound IP. Which one Azure uses depends on the
 account's region, so both are added to every such account.
 
-The script checks every storage account (or those in `STORAGE_ACCOUNTS`) and
-gives each one a status:
+The script checks every storage account in the target subscriptions (or
+those in `STORAGE_ACCOUNTS`) and gives each one a status:
 
 | Status | Meaning | What happens |
 |---|---|---|
@@ -142,11 +186,12 @@ gives each one a status:
 | `not_applicable` | File-share-only account | Nothing needed |
 | `not_found` | A name in `STORAGE_ACCOUNTS` doesn't exist | Check the name |
 
-**Approval.** The script lists the planned rule changes and asks
-`Apply these rule changes on N storage account(s)? [y/N]`. Only `y` or `yes`
-applies them. With `AUTO_APPROVE_NETWORK_CHANGES=true` it applies them
-without asking. If there's no terminal to ask (for example, in a pipeline)
-and auto-approve is off, nothing is changed and the accounts are reported as
+**Approval.** The script lists the planned rule changes for all target
+subscriptions and asks once: `Apply these rule changes on N storage
+account(s)? [y/N]`. Only `y` or `yes` applies them. With
+`AUTO_APPROVE_NETWORK_CHANGES=true` it applies them without asking. If
+there's no terminal to ask (for example, in a pipeline) and auto-approve is
+off, nothing is changed and the accounts are reported as
 `pending_approval`.
 
 **What it changes.** Only Lucidity's own rules are added (or, after an IP
@@ -160,12 +205,20 @@ by then. They make the run finish as `completed_with_warnings` instead.
 ## The report
 
 Every run, including one that fails, ends with a summary and writes
-`lucidity-onboarding-report-<sub>-<timestamp>.json` to the folder you ran it
+`lucidity-onboarding-report-<timestamp>.json` to the folder you ran it
 from. **Please send this file to your Lucidity contact.** It contains:
 
-- tenant ID, subscription ID and Lucidity's service principal object ID
-- the mode, and which features were switched on
-- the overall status: `completed`, `completed_with_warnings` or `failed`
+- tenant ID and Lucidity's service principal object ID
+- the scope type and IDs, the mode, and which features were switched on
+- whether Reservations Reader was assigned (`reservationsReader`)
+- every subscription found: onboarded, failed or skipped (and why), and
+  whether it uses its own roles or the management group's
+- the overall status:
+  - `completed`: everything worked
+  - `completed_with_warnings`: onboarded, with something to look at
+  - `completed_with_errors`: some subscriptions or management groups
+    failed; the others were onboarded
+  - `failed`: the run stopped before onboarding anything (or partway)
 - each step's result, with Azure's error message if it failed
 - each storage account's network status and what was changed
 
@@ -173,13 +226,18 @@ The report contains no secrets.
 
 ## Troubleshooting
 
-- **"set SUBSCRIPTION_ID and SP_OBJECT_ID"**: edit the values at the top of
-  the script.
+- **"set SCOPE_IDS and SP_OBJECT_ID"**: edit the values at the top of the
+  script.
 - **"not logged in to Azure CLI"**: run `az login`, then rerun.
-- **"… must be true or false"** or **"MODE must be …"**: fix that setting at
-  the top of the script.
+- **"… must be true or false"**, **"MODE must be …"** or **"SCOPE_TYPE must
+  be …"**: fix that setting at the top of the script.
 - **"Optimization access not approved"**: nothing was changed. Rerun and
-  answer `y`, or set `MODE="assessment"`.
+  answer `y`, or set `MODE="visibility"`.
+- **"management group … not found"**: check the management group ID (not
+  its display name) and that your account can see it.
+- **A subscription is skipped as "not found, or your account can't access
+  it"**: your account can't see it in this tenant. Check your access, or
+  that you're logged in to the right tenant.
 - **Reservations Reader warning**: expected unless you have tenant-level
   rights. Everything else works. A tenant administrator with elevated access
   can rerun the script to add it.
@@ -218,21 +276,7 @@ that change on Lucidity's side:
 
 ## Open items
 
-Known gaps and decisions still pending (as of 2026-10-22):
-
-**Decisions**
-- Whether the inventory policy write/delete permissions belong in
-  assessment mode.
-- Support for management groups and several subscriptions per run; the
-  script handles one subscription.
-- Whether disabled or warned subscriptions should be skipped.
-
-**Backend team**
-- Confirm nothing in Lucidity needs to read or list blobs outside
-  `lucidity-inventory`; the condition on the assignments blocks it.
-- Detect a missing Reservations Reader on Lucidity's side (for example, a
-  403 from the reservations API), rather than relying on customers sending
-  the report.
+As of 2026-10-22.
 
 **Scheduled changes**
 - Lucidity's outbound IP changes around 2026-11-16: update
@@ -240,21 +284,20 @@ Known gaps and decisions still pending (as of 2026-10-22):
   and update `LUCIDITY_EGRESS_IPS_VALID_UNTIL`.
 - Global service endpoint: switch over as described above.
 
-**Script gaps**
-- Customers onboarded by an earlier version have assignments without the
-  `lucidity-inventory` condition, and a rerun doesn't add it.
-- No teardown script for this version.
-
-**Not yet tested in real Azure**
+**Not yet tested in real Azure** (see the test log in
+[testing-guide.md](testing-guide.md))
+- Management group scope, several subscriptions per run, and skipping
+  subscriptions that aren't enabled.
+- Visibility mode, the optimization approval prompt, `GUEST_INSIGHTS=false`,
+  and detecting optimization access left from an earlier run.
+- Add-only role updates.
 - Subnet rules, including a customer storage account in a different tenant
   from Lucidity's subnet.
 - Running without a terminal, `AUTO_APPROVE_NETWORK_CHANGES=true` and
   `AUTO_APPROVE_OPTIMIZATION=true`.
-- The shorter console output for a failed Reservations Reader assignment.
-- Assessment mode, the optimization approval prompt, `GUEST_INSIGHTS=false`,
-  and detecting optimization access left from an earlier run.
+- Coloured output and the Reservations Reader warning.
 
 ## Previous version
 
 The earlier read-only assessment script, its `teardown.sh` and README are in
-[`legacy/`](legacy/). There is no teardown script for this version yet.
+[`legacy/`](legacy/). There is no teardown script for this version.

@@ -1,8 +1,8 @@
 # Testing read-only.sh
 
 How to test [`read-only.sh`](read-only.sh) end to end in a test Azure
-subscription. Run through it after every change to the script, and update
-this guide alongside the [README](README.md) whenever the script changes.
+tenant. Run through it after every change to the script, and update this
+guide alongside the [README](README.md) whenever the script changes.
 
 The tests use a **throwaway service principal** in place of Lucidity's, so
 you hold its credentials and can check what it can actually do.
@@ -11,6 +11,9 @@ you hold its credentials and can check what it can actually do.
 
 - A **test subscription** where you are Owner. Don't use a customer or
   production subscription.
+- For the management group scenarios, a **test management group** that
+  contains only test subscriptions, where you are Owner. If there isn't
+  one, [Setup step 6](#6-test-management-group-optional) creates one.
 - Permission to create app registrations in the tenant (most users have it
   unless an admin turned it off).
 - **Azure Cloud Shell in Bash mode** (not PowerShell). It has `az` and `jq`.
@@ -85,7 +88,8 @@ wget -O read-only.sh https://raw.githubusercontent.com/luciditycloud/utilities/r
 ```bash
 setv() { sed -i "s|^$1=.*|$1=$2|" read-only.sh; grep "^$1=" read-only.sh; }
 
-setv SUBSCRIPTION_ID "\"$SUB\""
+setv SCOPE_TYPE '"subscription"'
+setv SCOPE_IDS "\"$SUB\""
 setv SP_OBJECT_ID "\"$SP_OBJECT_ID\""
 setv STORAGE_ACCOUNTS "\"luctopen$SFX luctuk$SFX lucteast$SFX luctoff$SFX\""
 chmod +x read-only.sh
@@ -97,23 +101,48 @@ script never touches other storage accounts in the subscription.
 Re-uploading the script resets these settings: redo this step after every
 upload.
 
+### 6. Test management group (optional)
+
+Only for [scenario I](#i-management-group-scope). Skip this if you already
+have a test management group with only test subscriptions in it; set
+`MG=<its ID>` instead.
+
+Moving a subscription into a management group changes which policies and
+role assignments it inherits. Only do this with a test subscription, and
+move it back during cleanup.
+
+```bash
+MG=lucidity-test-mg-$SFX
+ORIGINAL_PARENT=$(az account management-group entities list \
+  --query "[?name=='$SUB'].parent.id | [0]" -o tsv)
+echo "ORIGINAL_PARENT=$ORIGINAL_PARENT"     # note it down: cleanup moves the subscription back here
+az account management-group create --name $MG -o none
+az account management-group subscription add --name $MG --subscription $SUB
+```
+
+A new management group, or a subscription just moved into one, can take a
+few minutes to appear in `az account management-group entities list`. If
+scenario I lists no subscriptions, wait and rerun.
+
 ## Scenarios
 
 Run them in order: later scenarios build on the state earlier ones leave.
 After each run, compare with the expected result and note anything
-different.
+different. All runs should show coloured output in Cloud Shell.
 
-### A. Assessment mode
+### A. Visibility mode
 
 ```bash
-setv MODE '"assessment"'
+setv MODE '"visibility"'
 ./read-only.sh
 ```
 
 Expected:
-- A progress line for each step, and no optimization approval prompt.
-- Reader: `[ok]`. Reservations Reader: `[warning]` with a short warning,
-  unless you have tenant-level rights.
+- `>> Targets (subscription):` listing the test subscription as `onboard`,
+  then a progress line for each step, and no optimization approval prompt.
+- Reader: `[ok]`. Reservations Reader: either `[ok]`, or `[warning]` with a
+  yellow warning block, repeated as "Reservations Reader is missing" in the
+  final summary (expected unless you have tenant-level rights).
 - Guest insights role created and assigned, with "blob reads limited to
   'lucidity-inventory'". No optimize role.
 - Storage network check:
@@ -124,8 +153,8 @@ Expected:
 - Prompt `Apply these rule changes on 2 storage account(s)?`: answer `y`.
   Both accounts become `applied`, or `failed` with Azure's error (record
   it: a failed subnet rule means the cross-tenant subnet rule doesn't work).
-- Final status: `completed_with_warnings` (Reservations Reader and
-  `luctoff…`).
+- Final status: `completed_with_warnings` (`luctoff…`, and Reservations
+  Reader if it failed).
 
 Then check the rules (both accounts):
 
@@ -146,18 +175,20 @@ setv MODE '"optimization"'
 ./read-only.sh       # answer n
 ```
 
-Expected: the approval banner lists "autoscaler, blobs"; after `n`,
-"Optimization access not approved. Nothing was changed." and status
-`failed` with `[failed] Optimization mode approval`. No role was changed.
+Expected: the approval banner says "1 subscription(s)" and lists
+"autoscaler, blobs"; after `n`, a red "optimization access not approved.
+Nothing was changed." and status `failed` with
+`[failed] Optimization mode approval`. No role was changed.
 
 ### C. Optimization mode, approved
 
 ```bash
-./read-only.sh       # answer y, then y at the network prompt if asked
+./read-only.sh       # answer y
 ```
 
 Expected:
-- Guest insights role: "Updating role …"; optimize role: "Creating role …".
+- Guest insights role: `unchanged` (nothing to add); optimize role:
+  "Creating role …".
 - Both custom role assignments `[ok]`, each with "blob reads limited to
   'lucidity-inventory'".
 - Storage accounts from scenario A: `already_allowed`, no network prompt.
@@ -169,32 +200,34 @@ Expected:
 ./read-only.sh       # answer y
 ```
 
-Expected: both roles "Updating role …", all assignments `[ok]` on the first
+Expected: both roles `unchanged`, all assignments `[ok]` on the first
 attempt (no "retrying" lines), storage accounts `already_allowed`.
 
-### E. Assessment after optimization
+### E. Visibility after optimization
 
 ```bash
-setv MODE '"assessment"'
+setv MODE '"visibility"'
 ./read-only.sh
 ```
 
-Expected: "Optimization features are ignored in assessment mode", then
-**NOTE: Lucidity already has optimization access …**, and
-`[ok] Existing optimization access` in the summary. The optimize role is
-still assigned (check in [Verify](#verify)).
+Expected: "Optimization features are ignored in visibility mode", then a
+yellow **NOTE: Lucidity already has optimization access on …**, and
+`[ok] Existing optimization access on …` in the summary. The optimize role
+is still assigned (check in [Verify](#verify)).
 
-### F. Run Command off
+### F. Updates only add: Run Command off
 
 ```bash
 setv GUEST_INSIGHTS false
 ./read-only.sh
-az role definition list --name lucidity-guest-insights-role-$SUB --query "[0].{description: description, runCommand: contains(permissions[0].actions, 'Microsoft.Compute/virtualMachines/runCommand/action')}"
+az role definition list --name lucidity-guest-insights-role-$SUB --scope /subscriptions/$SUB \
+  --query "[0].{description: description, runCommand: contains(permissions[0].actions, 'Microsoft.Compute/virtualMachines/runCommand/action')}"
 setv GUEST_INSIGHTS true
 ```
 
-Expected: the description no longer mentions Run Command, and `runCommand`
-is `false`.
+Expected: the guest role is `unchanged; kept 2 permission(s) this run
+didn't ask for (the script never removes permissions)`, and `runCommand` is
+still `true`.
 
 ### G. No terminal
 
@@ -204,7 +237,7 @@ setv MODE '"optimization"'
 ```
 
 Expected: "No terminal to ask for approval", nothing changed, status
-`failed`.
+`failed`, and no colours (output isn't a terminal).
 
 ```bash
 setv AUTO_APPROVE_OPTIMIZATION true
@@ -217,15 +250,78 @@ setv AUTO_APPROVE_NETWORK_CHANGES false
 Expected: "Auto-approved" for optimization, run completes
 (`completed_with_warnings`).
 
-### H. Invalid settings
+### H. Invalid settings and no colours
 
 ```bash
 setv BLOBS yes;  ./read-only.sh; setv BLOBS true
 setv MODE '"full"'; ./read-only.sh; setv MODE '"optimization"'
+setv SCOPE_TYPE '"tenant"'; ./read-only.sh; setv SCOPE_TYPE '"subscription"'
+NO_COLOR=1 ./read-only.sh < /dev/null | head -5
 ```
 
-Expected: "ERROR: BLOBS must be true or false", then "ERROR: MODE must be
-optimization or assessment", each before anything is changed.
+Expected: "ERROR: BLOBS must be true or false", "ERROR: MODE must be
+optimization or visibility" and "ERROR: SCOPE_TYPE must be subscription or
+management_group", each before anything is changed. The last run prints no
+colours.
+
+### I. Management group scope
+
+Needs [Setup step 6](#6-test-management-group-optional).
+
+**I1. A subscription with its own roles keeps them.** The test subscription
+has subscription-level roles from the scenarios above.
+
+```bash
+setv SCOPE_TYPE '"management_group"'
+setv SCOPE_IDS "\"$MG\""
+./read-only.sh       # answer y
+```
+
+Expected:
+- `>> Targets (management_group):` listing the test subscription under the
+  management group (and any other subscriptions in it).
+- "… already has subscription-level Lucidity roles; keeping and updating
+  them", and no "Creating role lucidity-…-role-$MG".
+- In the report, the subscription has `"rolesAt": "subscription"`.
+
+**I2. A subscription without its own roles gets the management group's.**
+Remove the subscription-level roles first (same steps as cleanup):
+
+```bash
+az role assignment list --assignee "$SP_OBJECT_ID" --scope "/subscriptions/$SUB" --query "[?starts_with(roleDefinitionName,'lucidity-')].id" -o tsv \
+  | xargs -r az role assignment delete --ids
+sleep 60
+for r in lucidity-guest-insights-role-$SUB lucidity-optimize-role-$SUB; do
+  az role definition delete --name "$r" --scope "/subscriptions/$SUB"
+done
+./read-only.sh       # answer y
+```
+
+Expected:
+- "Creating role lucidity-guest-insights-role-$MG…" and
+  "lucidity-optimize-role-$MG…", once each, then both assigned at
+  `/subscriptions/$SUB` with "blob reads limited to 'lucidity-inventory'".
+- In the report, `"rolesAt": "management_group"`.
+- The roles' assignable scope is the management group:
+
+```bash
+az role definition list --name lucidity-guest-insights-role-$MG \
+  --scope /providers/Microsoft.Management/managementGroups/$MG --query "[0].assignableScopes"
+```
+
+**I3. Skipped and missing scopes.** If the management group has a disabled
+or warned subscription, it's listed as `skip, subscription is …` and the
+run continues. To check a missing management group:
+
+```bash
+setv SCOPE_IDS "\"no-such-mg $MG\""
+./read-only.sh       # answer y
+setv SCOPE_IDS "\"$MG\""
+```
+
+Expected: "management group 'no-such-mg' not found …", the real management
+group still onboarded, status `completed_with_errors`, exit code 1
+(`echo $?`).
 
 ## Verify
 
@@ -249,7 +345,8 @@ Reports (one per run):
 
 ```bash
 for f in lucidity-onboarding-report-*.json; do
-  jq -c '{file: input_filename, mode, status, steps: [.steps[] | "\(.status) \(.step)"]}' "$f"
+  jq -c '{file: input_filename, scopeType, mode, status, reservationsReader,
+    subscriptions: [.subscriptions[] | "\(.subscriptionId) \(.status) \(.result // "") \(.rolesAt // "")"]}' "$f"
 done
 ```
 
@@ -282,17 +379,29 @@ sleep 60   # role deletion fails until Azure catches up with the assignment dele
 for r in lucidity-guest-insights-role-$SUB lucidity-optimize-role-$SUB; do
   az role definition delete --name "$r" --scope "/subscriptions/$SUB"
 done
+# Only if you ran scenario I
+for r in lucidity-guest-insights-role-$MG lucidity-optimize-role-$MG; do
+  az role definition delete --name "$r" --scope "/providers/Microsoft.Management/managementGroups/$MG"
+done
 
 az group delete -n $RG --yes --no-wait
 az ad sp delete --id "$APP_ID"
 rm -f sp.json t.txt lucidity-onboarding-report-*.json
 ```
 
-- If the role delete returns `RoleDefinitionHasAssignments`, wait another
+If you created the test management group in Setup step 6, move the
+subscription back and delete the group:
+
+```bash
+az account management-group subscription add --name "${ORIGINAL_PARENT##*/}" --subscription $SUB
+az account management-group delete --name $MG
+```
+
+- If a role delete returns `RoleDefinitionHasAssignments`, wait another
   minute and rerun the loop. If it persists, list who still holds the role
   (`az role assignment list --role <name> --scope /subscriptions/$SUB`); stop
   if it's anything other than the test service principal.
-- Delete only the two roles above. The test subscription may hold other
+- Delete only the roles above. The test subscription may hold other
   `lucidity-*` roles from earlier onboarding versions.
 
 ## Test log
@@ -301,4 +410,4 @@ Record each real-Azure test run here.
 
 | Date | Script commit | Tester | Scenarios | Result |
 |---|---|---|---|---|
-| 2026-10-22 | `475addc` and earlier | Swapnesh | Optimization (before modes existed): roles, rerun, condition, blob-read limit, Reservations Reader warning, IP rule, network prompt, report | Passed. Found and fixed: Reservations Reader role ID not recognized by `az`, no progress output |
+| 2026-10-22 | `475addc` and earlier | Swapnesh | Optimization (before modes and scopes existed): roles, rerun, condition, blob-read limit, Reservations Reader warning, IP rule, network prompt, report | Passed. Found and fixed: Reservations Reader role ID not recognized by `az`, no progress output |
