@@ -176,6 +176,10 @@ The report contains no secrets.
 - **"set SUBSCRIPTION_ID and SP_OBJECT_ID"**: edit the values at the top of
   the script.
 - **"not logged in to Azure CLI"**: run `az login`, then rerun.
+- **"… must be true or false"** or **"MODE must be …"**: fix that setting at
+  the top of the script.
+- **"Optimization access not approved"**: nothing was changed. Rerun and
+  answer `y`, or set `MODE="assessment"`.
 - **Reservations Reader warning**: expected unless you have tenant-level
   rights. Everything else works. A tenant administrator with elevated access
   can rerun the script to add it.
@@ -185,6 +189,12 @@ The report contains no secrets.
   from Lucidity before approving firewall rules.
 - **Storage account reported `failed`**: often an Azure Policy blocking
   network rule changes. The report has Azure's error.
+
+## For Lucidity: testing
+
+[testing-guide.md](testing-guide.md) walks through testing the script end to
+end in a test subscription. Run it after every change to the script, and
+update it alongside this README whenever the script changes.
 
 ## For Lucidity: maintaining the network details
 

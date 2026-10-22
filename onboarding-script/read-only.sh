@@ -70,6 +70,16 @@ case "$MODE" in
     exit 1 ;;
 esac
 
+for setting in AUTO_APPROVE_OPTIMIZATION AUTOSCALER IDLE_DISK DISK_TIERING BLOBS \
+    GUEST_INSIGHTS BLOB_VISIBILITY STORAGE_NETWORK_CHECK AUTO_APPROVE_NETWORK_CHANGES; do
+  case "${!setting}" in
+    true|false) ;;
+    *)
+      echo "ERROR: $setting must be true or false. Got: '${!setting}'" >&2
+      exit 1 ;;
+  esac
+done
+
 # Assessment mode never grants optimization permissions.
 OPTIMIZATION_FEATURES_IGNORED=false
 if [[ "$MODE" == assessment ]]; then
@@ -231,7 +241,8 @@ else
   echo " Lucidity will get write and delete permissions on this subscription" >&2
   echo " for: $FEATURE_LIST." >&2
   echo " These cover resources such as disks, snapshots, virtual machines," >&2
-  echo " resource locks and storage accounts. See the README for the full list." >&2
+  echo " resource locks and storage accounts. The full list is in this script," >&2
+  echo " under 'Optimization selections'." >&2
   echo " For read-only assessment instead, set MODE=\"assessment\" and rerun." >&2
   echo "=============================================================="  >&2
   approved=false
@@ -569,8 +580,9 @@ if [[ "$MODE" == assessment ]]; then
   existing=""
   if az role definition list --name "$OPTIMIZATION_ROLE" --scope "$SCOPE" \
       --query '[0].name' -o tsv 2>/dev/null | grep -q .; then
-    existing=$(az role assignment list --assignee "$SP_OBJECT_ID" \
-      --role "$OPTIMIZATION_ROLE" --scope "$SCOPE" --query '[0].id' -o tsv 2>/dev/null || true)
+    # Filter by principal ID: --assignee would need directory read access.
+    existing=$(az role assignment list --role "$OPTIMIZATION_ROLE" --scope "$SCOPE" \
+      --query "[?principalId=='$SP_OBJECT_ID'].id | [0]" -o tsv 2>/dev/null || true)
   fi
   if [[ -n "$existing" ]]; then
     record_step "Existing optimization access" "ok" false \
