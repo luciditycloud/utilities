@@ -145,12 +145,13 @@ Expected:
   final summary (expected unless you have tenant-level rights).
 - Guest insights role created and assigned, with "blob reads limited to
   'lucidity-inventory'". No optimize role.
-- Storage network check:
-  - `luctopen…`: `open`
-  - `luctuk…` and `lucteast…`: `needs_rule`, each with "will add subnet
-    rule …" and "will add ip rule 4.157.111.90"
-  - `luctoff…`: `public_access_disabled`
-- Prompt `Apply these rule changes on 2 storage account(s)?`: answer `y`.
+- `>> Storage accounts: 4`, with no blob setup status (`BLOB_SETUP` is
+  `lucidity`):
+  - `luctopen…`: `firewall open`
+  - `luctuk…` and `lucteast…`: `firewall needs_rule`, each with "will add
+    subnet rule …" and "will add ip rule 4.157.111.90"
+  - `luctoff…`: `firewall public_access_disabled`
+- Prompt `Apply these changes on 2 storage account(s)?`: answer `y`.
   Both accounts become `applied`, or `failed` with Azure's error (record
   it: a failed subnet rule means the cross-tenant subnet rule doesn't work).
 - Final status: `completed_with_warnings` (`luctoff…`, and Reservations
@@ -241,10 +242,10 @@ Expected: "No terminal to ask for approval", nothing changed, status
 
 ```bash
 setv AUTO_APPROVE_OPTIMIZATION true
-setv AUTO_APPROVE_NETWORK_CHANGES true
+setv AUTO_APPROVE_STORAGE_CHANGES true
 ./read-only.sh < /dev/null
 setv AUTO_APPROVE_OPTIMIZATION false
-setv AUTO_APPROVE_NETWORK_CHANGES false
+setv AUTO_APPROVE_STORAGE_CHANGES false
 ```
 
 Expected: "Auto-approved" for optimization, run completes
@@ -323,6 +324,62 @@ Expected: "management group 'no-such-mg' not found …", the real management
 group still onboarded, status `completed_with_errors`, exit code 1
 (`echo $?`).
 
+### J. Blob setup by the script
+
+Back at subscription scope. What you see first depends on scenario I:
+
+- **Skipped I (or ran only I1):** the subscription's guest role from the
+  earlier `BLOB_SETUP=lucidity` runs still has the container and blob
+  service write permissions, so the run highlights them.
+- **Ran I2:** the subscription's own roles were deleted, so this run
+  creates a new guest role without those two permissions (no NOTE). The
+  management group's guest role, still assigned from I2, keeps its own.
+
+```bash
+setv SCOPE_TYPE '"subscription"'
+setv SCOPE_IDS "\"$SUB\""
+setv MODE '"visibility"'
+setv BLOB_SETUP '"script"'
+./read-only.sh       # answer y at the storage prompt
+```
+
+Expected:
+- Skipped I: a yellow **NOTE: lucidity-guest-insights-role-… still has
+  container and blob service write permissions from an earlier run**, and
+  `[ok] Blob setup permissions in …` in the summary. The permissions are
+  kept. Ran I2: "Creating role lucidity-guest-insights-role-…" and no NOTE.
+- `>> Checking blob setup on …` for each storage account, then each account
+  shows both statuses, for example `firewall already_allowed, blob setup
+  needs_setup`, with "will create container lucidity-inventory" and "will
+  enable last access time tracking". `luctopen…` already has the container
+  (from setup step 3), so it only needs tracking.
+- `luctoff…` (public access disabled) is still set up: these are management
+  operations.
+- After `y`, the accounts become `applied`.
+
+Check the result on one account:
+
+```bash
+az storage account blob-service-properties show -g $RG -n luctuk$SFX --query lastAccessTimeTrackingPolicy.enable   # expect true
+az storage container-rm exists -g $RG --storage-account luctuk$SFX -n lucidity-inventory --query exists             # expect true
+```
+
+Rerun: every account shows `blob setup ready` and nothing is planned for
+the setup.
+
+**J2. A fresh role without the two permissions.** If you skipped I, remove
+the subscription's roles as in I2, then rerun. (If you ran I2, the role
+from J is already fresh.) The guest role's actions don't include
+`blobServices/write` or `containers/write`, and its description says the
+container and tracking are set up by the onboarding script:
+
+```bash
+az role definition list --name lucidity-guest-insights-role-$SUB --scope /subscriptions/$SUB \
+  --query "[0].{description: description, actions: permissions[0].actions}"
+```
+
+Afterwards: `setv BLOB_SETUP '"lucidity"'`.
+
 ## Verify
 
 Run as yourself after the scenarios.
@@ -345,7 +402,7 @@ Reports (one per run):
 
 ```bash
 for f in lucidity-onboarding-report-*.json; do
-  jq -c '{file: input_filename, scopeType, mode, status, reservationsReader,
+  jq -c '{file: input_filename, scopeType, mode, blobSetup, status, reservationsReader,
     subscriptions: [.subscriptions[] | "\(.subscriptionId) \(.status) \(.result // "") \(.rolesAt // "")"]}' "$f"
 done
 ```

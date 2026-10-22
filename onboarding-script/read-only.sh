@@ -30,12 +30,22 @@ BLOBS=true
 GUEST_INSIGHTS=true    # VM Run Command, so Lucidity can collect data inside VMs
 BLOB_VISIBILITY=true   # blob inventory, read only in the lucidity-inventory container
 
-# Storage network access (used when BLOBS or BLOB_VISIBILITY is on).
-# The script checks each storage account's firewall and lists the rules
-# Lucidity needs. Rules are added only after you approve them at the prompt,
-# or without asking when AUTO_APPROVE_NETWORK_CHANGES=true.
+# Who sets up blob visibility on each storage account: the lucidity-inventory
+# container and last access time tracking (used when BLOB_VISIBILITY is on).
+#   lucidity  Lucidity does it, so its role gets container and blob service
+#             write permissions.
+#   script    This script does it now, with your credentials, and Lucidity's
+#             role doesn't get those two permissions. Storage accounts created
+#             later need a rerun.
+BLOB_SETUP="lucidity"
+
+# Storage changes: firewall rules (used when BLOBS or BLOB_VISIBILITY is on)
+# and, with BLOB_SETUP=script, the container and last access time tracking.
+# The script lists what each storage account needs and makes the changes only
+# after you approve them at the prompt, or without asking when
+# AUTO_APPROVE_STORAGE_CHANGES=true.
 STORAGE_NETWORK_CHECK=true
-AUTO_APPROVE_NETWORK_CHANGES=false
+AUTO_APPROVE_STORAGE_CHANGES=false
 STORAGE_ACCOUNTS=""   # names, comma- or space-separated; empty = all in the target subscriptions
 
 # ---------- Lucidity network details (provided by Lucidity) ----------
@@ -103,8 +113,15 @@ case "$MODE" in
     exit 1 ;;
 esac
 
+case "$BLOB_SETUP" in
+  lucidity|script) ;;
+  *)
+    error "BLOB_SETUP must be lucidity or script. Got: '$BLOB_SETUP'"
+    exit 1 ;;
+esac
+
 for setting in AUTO_APPROVE_OPTIMIZATION AUTOSCALER IDLE_DISK DISK_TIERING BLOBS \
-    GUEST_INSIGHTS BLOB_VISIBILITY STORAGE_NETWORK_CHECK AUTO_APPROVE_NETWORK_CHANGES; do
+    GUEST_INSIGHTS BLOB_VISIBILITY STORAGE_NETWORK_CHECK AUTO_APPROVE_STORAGE_CHANGES; do
   case "${!setting}" in
     true|false) ;;
     *)
@@ -157,7 +174,7 @@ STEPS_FILE="$WORK_DIR/steps.jsonl"          # one line per step
 TARGETS_FILE="$WORK_DIR/targets.jsonl"      # one line per subscription found
 RESULTS_FILE="$WORK_DIR/results.jsonl"      # one line per subscription onboarded
 STORAGE_FILE="$WORK_DIR/storage.jsonl"      # one line per storage account
-NETWORK_CHECKED_FILE="$WORK_DIR/network-checked"
+STORAGE_CHECKED_FILE="$WORK_DIR/storage-checked"
 : > "$STEPS_FILE"; : > "$TARGETS_FILE"; : > "$RESULTS_FILE"; : > "$STORAGE_FILE"
 REPORT_FILE="$PWD/lucidity-onboarding-report-$(date -u +%Y%m%dT%H%M%SZ).json"
 TENANT_ID=""
@@ -184,9 +201,9 @@ to_json_list() {
 
 finish() {
   local rc=$?
-  local report status network_checked=false st step detail colour
+  local report status storage_checked=false st step detail colour
 
-  [[ -f "$NETWORK_CHECKED_FILE" ]] && network_checked=true
+  [[ -f "$STORAGE_CHECKED_FILE" ]] && storage_checked=true
   report=$(jq -s \
     --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg tenantId "$TENANT_ID" \
@@ -202,9 +219,11 @@ finish() {
     --argjson diskTiering "$DISK_TIERING" \
     --argjson blobs "$BLOBS" \
     --argjson blobVisibility "$BLOB_VISIBILITY" \
+    --arg blobSetup "$BLOB_SETUP" \
     --slurpfile targets "$TARGETS_FILE" \
     --slurpfile results "$RESULTS_FILE" \
-    --argjson networkChecked "$network_checked" \
+    --argjson storageChecked "$storage_checked" \
+    --argjson networkCheck "$STORAGE_NETWORK_CHECK" \
     --argjson egressIps "$(to_json_list "$LUCIDITY_EGRESS_IPS")" \
     --argjson retiredEgressIps "$(to_json_list "$LUCIDITY_RETIRED_EGRESS_IPS")" \
     --argjson subnetIds "$(to_json_list "$LUCIDITY_SUBNET_IDS")" \
@@ -224,6 +243,7 @@ finish() {
         blobs: $blobs,
         blobVisibility: $blobVisibility
       },
+      blobSetup: $blobSetup,
       reservationsReader: $reservationsReader,
       status: (if $rc != 0 then "failed"
                elif any(.[]; .required and .status == "failed") then "completed_with_errors"
@@ -232,7 +252,9 @@ finish() {
       subscriptions: [$targets[] | . as $t
         | . + ([$results[] | select(.subscriptionId == $t.subscriptionId)][0] // {})],
       steps: .,
-      storageNetwork: (if $networkChecked then {
+      storage: (if $storageChecked then {
+        networkChecked: $networkCheck,
+        blobSetup: $blobSetup,
         lucidityEgressIps: $egressIps,
         retiredEgressIps: $retiredEgressIps,
         luciditySubnetIds: $subnetIds,
@@ -365,6 +387,7 @@ ensure_role() {
     definition=$(make_role_definition "$role_name" "$description" "$actions" \
       "$data_actions" "[]" "[]" "$(jq -nc --arg s "$home_scope" '[$s]')")
     jq -c '.DataActions' <<< "$definition" > "$cache.data"
+    jq -c '.Actions' <<< "$definition" > "$cache.actions"
     detail="created"
   else
     merged=$(jq -c --argjson a "$actions" --argjson d "$data_actions" '
@@ -380,6 +403,7 @@ ensure_role() {
     kept=$(jq '.kept | length' <<< "$merged")
     role_id=$(jq -r '.name' <<< "$existing")
     jq -c '.dataActions' <<< "$merged" > "$cache.data"
+    jq -c '.actions' <<< "$merged" > "$cache.actions"
 
     if [[ "$added" -eq 0 ]]; then
       action="none"
@@ -438,6 +462,16 @@ ensure_role() {
 # True if the role (already set up this run) grants blob data reads.
 role_reads_blobs() {
   jq -e --arg r "$BLOB_READ" 'index($r) != null' "$WORK_DIR/role-$1.data" >/dev/null
+}
+
+# The two permissions Lucidity needs only when it sets up blob visibility
+# itself (BLOB_SETUP=lucidity).
+BLOB_SETUP_ACTIONS='["Microsoft.Storage/storageAccounts/blobServices/write","Microsoft.Storage/storageAccounts/blobServices/containers/write"]'
+
+# True if the role (already set up this run) has either of them.
+role_has_blob_setup_actions() {
+  jq -e --argjson s "$BLOB_SETUP_ACTIONS" 'any(.[]; . as $a | $s | index($a) != null)' \
+    "$WORK_DIR/role-$1.actions" >/dev/null
 }
 
 # Assigns a role to Lucidity's service principal and records the result.
@@ -500,11 +534,14 @@ EOF
     if [[ "$BLOB_VISIBILITY" == true ]]; then
       cat <<'EOF'
 Microsoft.Storage/storageAccounts/inventoryPolicies/write
-Microsoft.Storage/storageAccounts/blobServices/write
-Microsoft.Storage/storageAccounts/blobServices/containers/write
 Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action
 Microsoft.Storage/storageAccounts/inventoryPolicies/delete
 EOF
+      # Container and last access time tracking, unless this script sets
+      # them up (BLOB_SETUP=script).
+      if [[ "$BLOB_SETUP" == lucidity ]]; then
+        jq -r '.[]' <<< "$BLOB_SETUP_ACTIONS"
+      fi
     fi
   } | json_array
 )
@@ -519,8 +556,10 @@ GUEST_DESCRIPTION="Lucidity guest insights."
 if [[ "$GUEST_INSIGHTS" == true ]]; then
   GUEST_DESCRIPTION="$GUEST_DESCRIPTION Runs the Lucidity collector inside virtual machines via Run Command."
 fi
-if [[ "$BLOB_VISIBILITY" == true ]]; then
+if [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == lucidity ]]; then
   GUEST_DESCRIPTION="$GUEST_DESCRIPTION Blob visibility: manages blob inventory policies, the inventory container and last-access tracking, and reads blob data."
+elif [[ "$BLOB_VISIBILITY" == true ]]; then
+  GUEST_DESCRIPTION="$GUEST_DESCRIPTION Blob visibility: manages blob inventory policies and reads blob data; the inventory container and last-access tracking are set up by the onboarding script."
 fi
 
 # ---------- Optimization selections ----------
@@ -720,6 +759,10 @@ else
   echo " These cover resources such as disks, snapshots, virtual machines," >&2
   echo " resource locks and storage accounts. The full list is in this script," >&2
   echo " under 'Optimization selections'." >&2
+  if [[ "$BLOB_SETUP" == script && "$BLOBS" == true ]]; then
+    echo " Blob optimization (BLOBS) includes container and blob service write" >&2
+    echo " permissions, even with BLOB_SETUP=script." >&2
+  fi
   echo " For read-only visibility instead, set MODE=\"visibility\" and rerun." >&2
   echo "${BOLD}==============================================================${RESET}" >&2
   approved=false
@@ -807,6 +850,18 @@ onboard_subscription() {
     assign_role "$role_name" \
       "$sub_scope/providers/Microsoft.Authorization/roleDefinitions/$role_id" \
       "$sub_scope" true "$condition"
+
+    # Switching to BLOB_SETUP=script doesn't take away the write permissions
+    # an earlier run granted; the script reports them once per role.
+    if [[ "$BLOB_SETUP" == script && ! -f "$WORK_DIR/role-$role_name.noted" ]] &&
+        role_has_blob_setup_actions "$role_name"; then
+      touch "$WORK_DIR/role-$role_name.noted"
+      record_step "Blob setup permissions in $role_name" "ok" false \
+        "still has container and blob service write permissions from an earlier run; BLOB_SETUP=script does not remove them"
+      echo "" >&2
+      echo "${YELLOW}NOTE: $role_name still has container and blob service write" >&2
+      echo "  permissions from an earlier run. BLOB_SETUP=script does not remove them.${RESET}" >&2
+    fi
   fi
 
   if [[ ${#FEATURES[@]} -gt 0 ]]; then
@@ -851,44 +906,100 @@ while IFS=$'\t' read -r scope_id sub; do
       '{subscriptionId: $sub, result: $result}' >> "$RESULTS_FILE"
 done < <(jq -r 'select(.status == "eligible") | [.scopeId, .subscriptionId] | @tsv' "$TARGETS_FILE")
 
-# ---------- Storage network access ----------
-# Lucidity reads blob inventory over the storage data plane, which a storage
-# firewall can block. Lucidity's network tests (outbound via load balancer,
-# Regional service endpoint):
+
+# ---------- Storage accounts ----------
+# Two things can be needed on each storage account in the target
+# subscriptions.
+#
+# Firewall rules (STORAGE_NETWORK_CHECK). Lucidity reads blob inventory over
+# the storage data plane, which a storage firewall can block. Lucidity's
+# network tests (outbound via load balancer, Regional service endpoint):
 #   - Accounts in Lucidity's region (and possibly its paired region) see
 #     Lucidity's subnet, so the subnet rule applies.
 #   - Accounts in other regions see Lucidity's public IP, so the IP rule
 #     applies.
-# Adding both to every firewalled account covers either case.
-# Only Lucidity's own rules are added or removed. defaultAction and
-# publicNetworkAccess are never changed. Uses your credentials, not Lucidity's.
+# Adding both to every firewalled account covers either case. Only Lucidity's
+# own rules are added or removed; defaultAction and publicNetworkAccess are
+# never changed.
+#
+# Blob setup (BLOB_SETUP=script): the lucidity-inventory container and last
+# access time tracking. These are management operations, so a storage
+# firewall doesn't block them.
+#
+# Changes use your credentials, not Lucidity's.
+
+# Storage account kinds that support blob inventory and last access time
+# tracking.
+BLOB_SETUP_KINDS='["StorageV2","BlobStorage","BlockBlobStorage"]'
 
 # What the customer should do about an account that needs attention.
-network_note() {
+storage_note() {
   local status="$1"
-  local result="$2"
+  local setup_status="$2"
+  local result="$3"
+  local notes=()
 
   case "$status" in
     public_access_disabled)
-      echo "Public network access is disabled. Allow selected networks and rerun, or ask Lucidity about a private endpoint." ;;
+      notes+=("Public network access is disabled. Allow selected networks and rerun, or ask Lucidity about a private endpoint.") ;;
     network_perimeter)
-      echo "Secured by a network security perimeter. Add Lucidity to the perimeter's access rules." ;;
+      notes+=("Secured by a network security perimeter. Add Lucidity to the perimeter's access rules.") ;;
     not_found)
-      echo "Not found in the target subscriptions. Check the name in STORAGE_ACCOUNTS." ;;
-    *)
-      case "$result" in
-        pending_approval) echo "Rules not added. Rerun and approve, or set AUTO_APPROVE_NETWORK_CHANGES=true." ;;
-        failed) echo "Adding rules failed (see report for the error)." ;;
-      esac ;;
+      notes+=("Not found in the target subscriptions. Check the name in STORAGE_ACCOUNTS.") ;;
+  esac
+  [[ "$setup_status" == check_failed ]] &&
+    notes+=("Couldn't check the container or last access time tracking; see the report.")
+  case "$result" in
+    pending_approval)
+      notes+=("Changes not made. Rerun and approve, or set AUTO_APPROVE_STORAGE_CHANGES=true.") ;;
+    failed)
+      notes+=("Some changes failed; see the report for the error.") ;;
+  esac
+  echo "${notes[*]:-}"
+}
+
+# Runs one planned change on a storage account. Prints Azure's error on
+# failure.
+apply_storage_action() {
+  local sub="$1"
+  local rg="$2"
+  local name="$3"
+  local op="$4"
+  local type="$5"
+  local value="$6"
+
+  case "$type" in
+    ip|subnet)
+      local flag="--ip-address"
+      [[ "$type" == subnet ]] && flag="--subnet"
+      progress "${name}: ${op} ${type} rule ${value}..."
+      az storage account network-rule "$op" --subscription "$sub" \
+        -g "$rg" --account-name "$name" "$flag" "$value" \
+        --only-show-errors 2>&1 >/dev/null </dev/null ;;
+    container)
+      progress "${name}: creating container ${value}..."
+      az storage container-rm create --subscription "$sub" -g "$rg" \
+        --storage-account "$name" -n "$value" \
+        --only-show-errors 2>&1 >/dev/null </dev/null ;;
+    last_access_tracking)
+      progress "${name}: enabling last access time tracking..."
+      az storage account blob-service-properties update --subscription "$sub" \
+        -g "$rg" -n "$name" --enable-last-access-tracking true \
+        --only-show-errors 2>&1 >/dev/null </dev/null ;;
   esac
 }
 
-check_storage_network() {
-  local listed plan pending answer apply=false sub
+check_storage() {
+  local network="$STORAGE_NETWORK_CHECK" setup=false
   local accounts_file="$WORK_DIR/accounts.jsonl"
-  local record name rg op type value flag err failures attention total
+  local checked_file="$WORK_DIR/accounts-checked.jsonl"
+  local listed plan pending answer apply=false sub record name rg
+  local op type value err failures attention total lat exists check_err
 
-  if [[ "$(date -u +%Y-%m-%d)" > "$LUCIDITY_EGRESS_IPS_VALID_UNTIL" ]]; then
+  [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == script ]] && setup=true
+
+  if [[ "$network" == true &&
+        "$(date -u +%Y-%m-%d)" > "$LUCIDITY_EGRESS_IPS_VALID_UNTIL" ]]; then
     record_step "Lucidity egress IP check" "warning" false \
       "LUCIDITY_EGRESS_IPS was due to change on $LUCIDITY_EGRESS_IPS_VALID_UNTIL; IP rules may be outdated."
     warn "Lucidity's outbound IP was due to change on $LUCIDITY_EGRESS_IPS_VALID_UNTIL." \
@@ -906,64 +1017,122 @@ check_storage_network() {
           ipRules: networkRuleSet.ipRules[].ipAddressOrRange,
           vnetRules: networkRuleSet.virtualNetworkRules[].virtualNetworkResourceId}" \
         -o json --only-show-errors 2>"$WORK_DIR/storage-list.err"); then
-      record_step "Storage network check in $sub" "warning" false \
+      record_step "Storage check in $sub" "warning" false \
         "could not list storage accounts: $(tr '\n' ' ' < "$WORK_DIR/storage-list.err")"
       continue
     fi
-    jq -c --arg sub "$sub" '.[] | . + {subscriptionId: $sub}' <<< "$listed" >> "$accounts_file"
+    jq -c --arg sub "$sub" --argjson wanted "$(to_json_list "$STORAGE_ACCOUNTS")" \
+      '.[] | select($wanted == [] or (.name as $n | any($wanted[]; . == $n)))
+       | . + {subscriptionId: $sub}' <<< "$listed" >> "$accounts_file"
   done
-  : > "$NETWORK_CHECKED_FILE"
+  : > "$STORAGE_CHECKED_FILE"
 
-  # One entry per account: its network state, a status, and the rule changes
-  # Lucidity needs (actions).
+  # Blob setup needs each account's current container and tracking state.
+  : > "$checked_file"
+  while IFS= read -r record; do
+    if [[ "$setup" == true ]] &&
+        jq -e --argjson k "$BLOB_SETUP_KINDS" '.kind as $kind | any($k[]; . == $kind)' \
+          <<< "$record" >/dev/null; then
+      sub=$(jq -r .subscriptionId <<< "$record")
+      name=$(jq -r .name <<< "$record")
+      rg=$(jq -r .resourceGroup <<< "$record")
+      progress "Checking blob setup on $name..."
+      check_err=""
+      if ! lat=$(az storage account blob-service-properties show --subscription "$sub" \
+          -g "$rg" -n "$name" --query "lastAccessTimeTrackingPolicy.enable" -o tsv \
+          --only-show-errors 2>"$WORK_DIR/err" </dev/null); then
+        check_err="last access time tracking: $(tr '\n' ' ' < "$WORK_DIR/err")"
+      fi
+      if ! exists=$(az storage container-rm exists --subscription "$sub" -g "$rg" \
+          --storage-account "$name" -n "$INVENTORY_CONTAINER" --query exists -o tsv \
+          --only-show-errors 2>"$WORK_DIR/err" </dev/null); then
+        check_err="${check_err:+$check_err; }container: $(tr '\n' ' ' < "$WORK_DIR/err")"
+      fi
+      jq -c --arg lat "${lat:-}" --arg exists "${exists:-}" --arg err "$check_err" \
+        '. + {latEnabled: ($lat == "true"), containerExists: ($exists == "true")}
+         + (if $err != "" then {setupCheckError: $err} else {} end)' \
+        <<< "$record" >> "$checked_file"
+    else
+      echo "$record" >> "$checked_file"
+    fi
+  done < "$accounts_file"
+
+  # One entry per account: its firewall status, its blob setup status, and
+  # the changes it needs (actions).
   plan=$(jq -sc \
     --argjson wanted "$(to_json_list "$STORAGE_ACCOUNTS")" \
     --argjson ips "$(to_json_list "$LUCIDITY_EGRESS_IPS")" \
     --argjson retired "$(to_json_list "$LUCIDITY_RETIRED_EGRESS_IPS")" \
-    --argjson subnets "$(to_json_list "$LUCIDITY_SUBNET_IDS")" '
+    --argjson subnets "$(to_json_list "$LUCIDITY_SUBNET_IDS")" \
+    --argjson network "$network" \
+    --argjson setup "$setup" \
+    --argjson kinds "$BLOB_SETUP_KINDS" \
+    --arg container "$INVENTORY_CONTAINER" '
     def has_ip($a; $ip): ($a.ipRules // []) | any(. == $ip or . == ($ip + "/32"));
     def has_subnet($a; $s): ($a.vnetRules // []) | any(ascii_downcase == ($s | ascii_downcase));
     def ip_adds($a): [$ips[] | select(has_ip($a; .) | not) | {op: "add", type: "ip", value: .}];
     def ip_removals($a): [$retired[] | select(has_ip($a; .)) | {op: "remove", type: "ip", value: .}];
     def subnet_adds($a):
       [$subnets[] | select(has_subnet($a; .) | not) | {op: "add", type: "subnet", value: .}];
+    def network_part($a; $base):
+      if ($network | not) then {status: "not_checked", actions: []}
+      elif $a.kind == "FileStorage" then {status: "not_applicable", actions: []}
+      elif $base.publicNetworkAccess == "Disabled" then {status: "public_access_disabled", actions: []}
+      elif $base.publicNetworkAccess == "SecuredByPerimeter" then {status: "network_perimeter", actions: []}
+      elif $base.defaultAction == "Allow" then {status: "open", actions: []}
+      else
+        (subnet_adds($a) + ip_adds($a) + ip_removals($a)) as $actions
+        | {status: (if $actions == [] then "already_allowed" else "needs_rule" end), actions: $actions}
+      end;
+    def setup_part($a):
+      if ($setup | not) then {setupStatus: "not_requested", actions: []}
+      elif (any($kinds[]; . == $a.kind) | not) then {setupStatus: "not_supported", actions: []}
+      elif $a.setupCheckError then
+        {setupStatus: "check_failed", actions: [], setupDetail: $a.setupCheckError}
+      else
+        ([if $a.containerExists then empty else {op: "create", type: "container", value: $container} end]
+         + [if $a.latEnabled then empty else {op: "enable", type: "last_access_tracking", value: "true"} end]) as $s
+        | {setupStatus: (if $s == [] then "ready" else "needs_setup" end), actions: $s}
+      end;
     def classify:
       . as $a
       | {subscriptionId, name, resourceGroup, location, kind,
          publicNetworkAccess: (.publicNetworkAccess // "Enabled"),
          defaultAction: (.defaultAction // "Allow")} as $base
-      | if $a.kind == "FileStorage" then $base + {status: "not_applicable", actions: []}
-        elif $base.publicNetworkAccess == "Disabled" then $base + {status: "public_access_disabled", actions: []}
-        elif $base.publicNetworkAccess == "SecuredByPerimeter" then $base + {status: "network_perimeter", actions: []}
-        elif $base.defaultAction == "Allow" then $base + {status: "open", actions: []}
-        else
-          (subnet_adds($a) + ip_adds($a) + ip_removals($a)) as $actions
-          | $base + {status: (if $actions == [] then "already_allowed" else "needs_rule" end),
-                     actions: $actions}
-        end;
+      | network_part($a; $base) as $n
+      | setup_part($a) as $s
+      | $base + {status: $n.status, setupStatus: $s.setupStatus, actions: ($n.actions + $s.actions)}
+        + (if $s.setupDetail then {setupDetail: $s.setupDetail} else {} end);
     . as $all
-    | [$all[] | .name as $n | select($wanted == [] or any($wanted[]; . == $n)) | classify]
+    | [$all[] | classify]
       + [$wanted[] | . as $w | select($all | all(.name != $w))
-         | {name: $w, status: "not_found", actions: []}]' "$accounts_file")
+         | {name: $w, status: "not_found", setupStatus: "not_found", actions: []}]' "$checked_file")
 
   total=$(jq length <<< "$plan")
   pending=$(jq '[.[] | select(.actions != [])] | length' <<< "$plan")
 
   echo ""
-  echo "${BOLD}>> Storage network check: $total account(s)${RESET}"
-  jq -r '.[] | "   \(.name) [\(.location // "-")] in \(.subscriptionId // "-"): \(.status)",
-    (.actions[] | "      will \(.op) \(.type) rule \(.value)")' <<< "$plan"
+  echo "${BOLD}>> Storage accounts: $total${RESET}"
+  jq -r --argjson network "$network" --argjson setup "$setup" '.[]
+    | "   \(.name) [\(.location // "-")] in \(.subscriptionId // "-"): "
+      + ([(if $network or .status == "not_found" then "firewall \(.status)" else empty end),
+          (if $setup and .status != "not_found" then "blob setup \(.setupStatus)" else empty end)]
+         | join(", ")),
+      (.actions[] | "      will "
+        + (if .type == "container" then "create container \(.value)"
+           elif .type == "last_access_tracking" then "enable last access time tracking"
+           else "\(.op) \(.type) rule \(.value)" end))' <<< "$plan"
 
   if [[ "$pending" -gt 0 ]]; then
-    if [[ "$AUTO_APPROVE_NETWORK_CHANGES" == true ]]; then
+    if [[ "$AUTO_APPROVE_STORAGE_CHANGES" == true ]]; then
       apply=true
-      echo "   Auto-approved (AUTO_APPROVE_NETWORK_CHANGES=true)."
+      echo "   Auto-approved (AUTO_APPROVE_STORAGE_CHANGES=true)."
     elif [[ -t 0 ]]; then
-      printf "   Apply these rule changes on %s storage account(s)? [y/N] " "$pending"
+      printf "   Apply these changes on %s storage account(s)? [y/N] " "$pending"
       read -r answer || answer=""
       [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]] && apply=true
     else
-      echo "   No terminal to ask for approval, so no rules were changed."
+      echo "   No terminal to ask for approval, so nothing was changed."
     fi
   fi
 
@@ -982,12 +1151,7 @@ check_storage_network() {
     rg=$(jq -r .resourceGroup <<< "$record")
     failures=""
     while IFS=$'\t' read -r op type value; do
-      flag="--ip-address"
-      [[ "$type" == subnet ]] && flag="--subnet"
-      progress "${name}: ${op} ${type} rule ${value}..."
-      if ! err=$(az storage account network-rule "$op" --subscription "$sub" \
-          -g "$rg" --account-name "$name" "$flag" "$value" \
-          --only-show-errors 2>&1 >/dev/null </dev/null); then
+      if ! err=$(apply_storage_action "$sub" "$rg" "$name" "$op" "$type" "$value"); then
         failures="${failures}${op} ${type} ${value}: ${err}; "
       fi
     done < <(jq -r '.actions[] | [.op, .type, .value] | @tsv' <<< "$record")
@@ -1002,35 +1166,44 @@ check_storage_network() {
 
   attention=$(jq -sc '[.[] | select(
       (.status | IN("public_access_disabled", "network_perimeter", "not_found"))
+      or .setupStatus == "check_failed"
       or (.result | IN("pending_approval", "failed")))]' "$STORAGE_FILE")
 
   if [[ "$(jq length <<< "$attention")" -eq 0 ]]; then
-    record_step "Storage network check" "ok" false \
+    record_step "Storage check" "ok" false \
       "$total account(s) checked; none need attention"
     return 0
   fi
 
-  record_step "Storage network check" "warning" false \
-    "$(jq length <<< "$attention") of $total account(s) need attention (see storageNetwork in the report)"
+  record_step "Storage check" "warning" false \
+    "$(jq length <<< "$attention") of $total account(s) need attention (see storage in the report)"
   echo ""
   echo "${YELLOW}   Storage accounts that need attention:"
-  while IFS=$'\t' read -r name status result; do
-    echo "   - $name: $(network_note "$status" "$result")"
-  done < <(jq -r '.[] | [.name, .status, .result] | @tsv' <<< "$attention")
+  while IFS=$'\t' read -r name status setup_status result; do
+    echo "   - $name: $(storage_note "$status" "$setup_status" "$result")"
+  done < <(jq -r '.[] | [.name, .status, .setupStatus, .result] | @tsv' <<< "$attention")
   printf '%s' "$RESET"
 }
 
 # The roles are in place by now, so a problem here is a warning, never a
 # failed onboarding. The check reads stdin for its prompt, so it isn't run
 # through run_contained.
+RUN_STORAGE=false
 if [[ "$STORAGE_NETWORK_CHECK" == true &&
       ( "$BLOBS" == true || "$BLOB_VISIBILITY" == true ) ]]; then
+  RUN_STORAGE=true
+fi
+if [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == script ]]; then
+  RUN_STORAGE=true
+fi
+
+if [[ "$RUN_STORAGE" == true ]]; then
   set +e
-  ( set -e; check_storage_network )
-  network_rc=$?
+  ( set -e; check_storage )
+  storage_rc=$?
   set -e
-  if [[ "$network_rc" -ne 0 ]]; then
-    record_step "Storage network check" "warning" false \
+  if [[ "$storage_rc" -ne 0 ]]; then
+    record_step "Storage check" "warning" false \
       "the check stopped unexpectedly; see the console output above"
   fi
 fi

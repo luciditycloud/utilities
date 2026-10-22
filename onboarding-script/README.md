@@ -82,9 +82,9 @@ The script first lists the subscriptions it found and which it will skip.
 In optimization mode it then lists the optimization features and asks
 `Grant optimization access? [y/N]`. Only `y` or `yes` continues; anything
 else stops the script before it changes anything. A run asks at most two
-questions, this one and the storage firewall one, whatever the number of
-subscriptions. For unattended runs, set `AUTO_APPROVE_OPTIMIZATION=true`
-and `AUTO_APPROVE_NETWORK_CHANGES=true`.
+questions, this one and the [storage accounts](#storage-accounts) one,
+whatever the number of subscriptions. For unattended runs, set
+`AUTO_APPROVE_OPTIMIZATION=true` and `AUTO_APPROVE_STORAGE_CHANGES=true`.
 
 Rerunning is safe: existing roles and assignments are updated in place.
 
@@ -112,8 +112,9 @@ they're off automatically when the output isn't a terminal.
 | `BLOBS` | `true` | Blob optimization permissions (optimization only) |
 | `GUEST_INSIGHTS` | `true` | VM Run Command, so Lucidity can collect data inside VMs (both modes) |
 | `BLOB_VISIBILITY` | `true` | Blob inventory permissions, so Lucidity can see your blob storage (both modes) |
+| `BLOB_SETUP` | `lucidity` | Who creates the inventory container and turns on last access time tracking: `lucidity` or `script` (see [Blob visibility setup](#blob-visibility-setup)) |
 | `STORAGE_NETWORK_CHECK` | `true` | Check storage firewalls (when `BLOBS` or `BLOB_VISIBILITY` is on) |
-| `AUTO_APPROVE_NETWORK_CHANGES` | `false` | Add the firewall rules without asking |
+| `AUTO_APPROVE_STORAGE_CHANGES` | `false` | Make the storage account changes (firewall rules, blob setup) without asking |
 | `STORAGE_ACCOUNTS` | empty | Limit the firewall check to these accounts (comma- or space-separated); empty means all in the target subscriptions |
 
 The settings under *Lucidity network details* are provided by Lucidity.
@@ -125,7 +126,7 @@ Don't change them unless Lucidity asks you to.
 |---|---|---|---|
 | **Reader** (built-in) | Read all resource configuration | ✅ | ✅ |
 | **Reservations Reader** (built-in), at `/providers/Microsoft.Capacity` | Read Azure reservations (optional, tenant-wide) | ✅ attempted | ✅ attempted |
-| `lucidity-guest-insights-role-<id>` | With `GUEST_INSIGHTS`: run the Lucidity collector inside VMs and scale-set instances (Run Command). With `BLOB_VISIBILITY`: manage blob inventory policies, the inventory container and last-access tracking; read blob data | ✅ | ✅ |
+| `lucidity-guest-insights-role-<id>` | With `GUEST_INSIGHTS`: run the Lucidity collector inside VMs and scale-set instances (Run Command). With `BLOB_VISIBILITY`: manage blob inventory policies and read blob data; with `BLOB_SETUP=lucidity`, also create the inventory container and turn on last access time tracking | ✅ | ✅ |
 | `lucidity-optimize-role-<id>` | Write and delete permissions for the selected optimization features | ❌ | ✅ when any of `AUTOSCALER`, `IDLE_DISK`, `DISK_TIERING`, `BLOBS` is on |
 
 **Where the roles live:**
@@ -165,16 +166,54 @@ permissions are unaffected.
 disabled or warned), or that your account can't see, are skipped and
 listed in the report.
 
-## Storage network check
+## Blob visibility setup
 
-Lucidity reads the blob inventory reports over the network. If a storage
-account's firewall allows only selected networks, Lucidity needs rules
-allowing its traffic: a **subnet rule** for Lucidity's subnet and an **IP
-rule** for Lucidity's outbound IP. Which one Azure uses depends on the
-account's region, so both are added to every such account.
+For blob visibility, each storage account needs the `lucidity-inventory`
+container and **last access time tracking** turned on. `BLOB_SETUP` decides
+who does that:
+
+- **`lucidity`** (default): Lucidity does it, so its role gets
+  `blobServices/write` (last access time tracking) and `containers/write`
+  (the container) on every storage account. Storage accounts created later
+  are set up by Lucidity automatically.
+- **`script`**: this script does it now, with **your** credentials, and
+  Lucidity's role doesn't get those two permissions. **Storage accounts
+  created later aren't set up until you rerun the script.**
+
+In both cases Lucidity keeps the inventory policy permissions
+(`inventoryPolicies/write` and `delete`): it manages the inventory policy
+itself.
+
+Things to know about `script`:
+
+- The setup is part of the [storage accounts](#storage-accounts) step and
+  its single approval prompt.
+- It applies to account kinds that support blob inventory: StorageV2,
+  BlobStorage and BlockBlobStorage. Other kinds are reported as
+  `not_supported`.
+- Setup changes aren't blocked by storage firewalls, but Lucidity still
+  needs network access to read the reports.
+- Blob optimization (`BLOBS`, optimization mode) has its own container and
+  blob service write permissions, whatever `BLOB_SETUP` is.
+- Switching an existing customer from `lucidity` to `script` doesn't take
+  the two permissions away (updates only ever add). The script highlights
+  them instead.
+
+## Storage accounts
 
 The script checks every storage account in the target subscriptions (or
-those in `STORAGE_ACCOUNTS`) and gives each one a status:
+those in `STORAGE_ACCOUNTS`) for two things:
+
+- **Firewall** (`STORAGE_NETWORK_CHECK`): Lucidity reads the blob inventory
+  reports over the network. If a storage account's firewall allows only
+  selected networks, Lucidity needs rules allowing its traffic: a **subnet
+  rule** for Lucidity's subnet and an **IP rule** for Lucidity's outbound
+  IP. Which one Azure uses depends on the account's region, so both are
+  added to every such account.
+- **Blob setup** (`BLOB_SETUP=script`): the container and last access time
+  tracking (see [Blob visibility setup](#blob-visibility-setup)).
+
+Firewall status:
 
 | Status | Meaning | What happens |
 |---|---|---|
@@ -185,22 +224,35 @@ those in `STORAGE_ACCOUNTS`) and gives each one a status:
 | `network_perimeter` | Secured by a network security perimeter | Manual: add Lucidity to the perimeter's access rules |
 | `not_applicable` | File-share-only account | Nothing needed |
 | `not_found` | A name in `STORAGE_ACCOUNTS` doesn't exist | Check the name |
+| `not_checked` | `STORAGE_NETWORK_CHECK=false` | Nothing |
 
-**Approval.** The script lists the planned rule changes for all target
-subscriptions and asks once: `Apply these rule changes on N storage
-account(s)? [y/N]`. Only `y` or `yes` applies them. With
-`AUTO_APPROVE_NETWORK_CHANGES=true` it applies them without asking. If
+Blob setup status (with `BLOB_SETUP=script`):
+
+| Status | Meaning | What happens |
+|---|---|---|
+| `ready` | Container exists and tracking is on | Nothing needed |
+| `needs_setup` | Container missing or tracking off | Set up, after your approval |
+| `not_supported` | Account kind doesn't support blob inventory | Nothing |
+| `check_failed` | The script couldn't read the account's settings | Check your access; the report has Azure's error |
+| `not_requested` | `BLOB_SETUP=lucidity` | Lucidity does it |
+
+**Approval.** The script lists the planned changes for all target
+subscriptions and asks once: `Apply these changes on N storage account(s)?
+[y/N]`. Only `y` or `yes` applies them. With
+`AUTO_APPROVE_STORAGE_CHANGES=true` it applies them without asking. If
 there's no terminal to ask (for example, in a pipeline) and auto-approve is
 off, nothing is changed and the accounts are reported as
 `pending_approval`.
 
-**What it changes.** Only Lucidity's own rules are added (or, after an IP
-change, the old Lucidity IP removed). The script never changes an account's
-default action or public network access, and never touches your own rules.
-Changes are made with your credentials.
+**What it changes.** Only Lucidity's own firewall rules are added (or, after
+an IP change, the old Lucidity IP removed), plus the container and tracking
+with `BLOB_SETUP=script`. The script never changes an account's default
+action or public network access, and never touches your own rules. Changes
+are made with your credentials.
 
-Firewall problems never fail the onboarding: the roles are already in place
-by then. They make the run finish as `completed_with_warnings` instead.
+Storage account problems never fail the onboarding: the roles are already in
+place by then. They make the run finish as `completed_with_warnings`
+instead.
 
 ## The report
 
@@ -210,7 +262,8 @@ from. **Please send this file to your Lucidity contact.** It contains:
 
 - tenant ID and Lucidity's service principal object ID
 - the scope type and IDs, the mode, and which features were switched on
-- whether Reservations Reader was assigned (`reservationsReader`)
+- whether Reservations Reader was assigned (`reservationsReader`), and
+  `blobSetup`
 - every subscription found: onboarded, failed or skipped (and why), and
   whether it uses its own roles or the management group's
 - the overall status:
@@ -220,7 +273,8 @@ from. **Please send this file to your Lucidity contact.** It contains:
     failed; the others were onboarded
   - `failed`: the run stopped before onboarding anything (or partway)
 - each step's result, with Azure's error message if it failed
-- each storage account's network status and what was changed
+- each storage account's firewall and blob setup status, and what was
+  changed (under `storage`)
 
 The report contains no secrets.
 
@@ -229,8 +283,9 @@ The report contains no secrets.
 - **"set SCOPE_IDS and SP_OBJECT_ID"**: edit the values at the top of the
   script.
 - **"not logged in to Azure CLI"**: run `az login`, then rerun.
-- **"… must be true or false"**, **"MODE must be …"** or **"SCOPE_TYPE must
-  be …"**: fix that setting at the top of the script.
+- **"… must be true or false"**, **"MODE must be …"**, **"SCOPE_TYPE must
+  be …"** or **"BLOB_SETUP must be …"**: fix that setting at the top of the
+  script.
 - **"Optimization access not approved"**: nothing was changed. Rerun and
   answer `y`, or set `MODE="visibility"`.
 - **"management group … not found"**: check the management group ID (not
@@ -246,7 +301,9 @@ The report contains no secrets.
 - **"Lucidity's outbound IP was due to change"**: get the latest script
   from Lucidity before approving firewall rules.
 - **Storage account reported `failed`**: often an Azure Policy blocking
-  network rule changes. The report has Azure's error.
+  network rule or storage changes. The report has Azure's error.
+- **Blob setup `check_failed`**: your account couldn't read that storage
+  account's settings. The report has Azure's error.
 
 ## For Lucidity: testing
 
@@ -293,7 +350,9 @@ As of 2026-10-22.
 - Add-only role updates.
 - Subnet rules, including a customer storage account in a different tenant
   from Lucidity's subnet.
-- Running without a terminal, `AUTO_APPROVE_NETWORK_CHANGES=true` and
+- `BLOB_SETUP=script`: creating the container and turning on last access
+  time tracking with the customer's credentials.
+- Running without a terminal, `AUTO_APPROVE_STORAGE_CHANGES=true` and
   `AUTO_APPROVE_OPTIMIZATION=true`.
 - Coloured output and the Reservations Reader warning.
 
