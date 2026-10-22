@@ -143,8 +143,9 @@ finish() {
   echo ""
   echo "=============================================================="
   echo " Lucidity onboarding: $(jq -r .status <<< "$report")"
+  # Console shows the first line of each detail; the report keeps all of it.
   jq -r '.steps[] | "   [\(.status)] \(.step)" +
-    (if .detail != "" then "\n      \(.detail)" else "" end)' <<< "$report"
+    (if .detail != "" then "\n      \(.detail | split("\n")[0])" else "" end)' <<< "$report"
   if printf '%s\n' "$report" > "$REPORT_FILE"; then
     echo ""
     echo " Report: $REPORT_FILE"
@@ -161,6 +162,12 @@ finish() {
 }
 trap finish EXIT
 
+# Progress goes to stderr, since some functions' stdout is captured.
+progress() {
+  echo ">> $*" >&2
+}
+
+progress "Selecting subscription $SUBSCRIPTION_ID..."
 az account set --subscription "$SUBSCRIPTION_ID"
 TENANT_ID=$(az account show --query tenantId -o tsv)
 
@@ -181,6 +188,11 @@ upsert_role() {
     action="update"
   fi
 
+  if [[ "$action" == create ]]; then
+    progress "Creating role $role_name..."
+  else
+    progress "Updating role $role_name..."
+  fi
   if ! err=$(az role definition "$action" \
       --role-definition "$definition_file" 2>&1 >/dev/null); then
     record_step "Role definition $role_name" "failed" true "$action failed: $err"
@@ -194,6 +206,7 @@ upsert_role() {
     role_id=$(az role definition list --name "$role_name" \
       --query '[0].name' -o tsv)
     [[ -n "$role_id" ]] && break
+    echo "   Waiting for the role to appear in Azure ($attempt/$RETRY_ATTEMPTS)..." >&2
     sleep "$RETRY_DELAY"
   done
 
@@ -224,6 +237,7 @@ assign_role() {
     detail="blob reads limited to '$INVENTORY_CONTAINER'"
   fi
 
+  progress "Assigning $label at $scope..."
   # Retries cover replication delay for a just-created role or principal.
   # Missing permissions won't fix themselves, so those aren't retried.
   for attempt in $(seq 1 "$RETRY_ATTEMPTS"); do
@@ -238,11 +252,18 @@ assign_role() {
       return 0
     fi
     [[ "$err" == *AuthorizationFailed* ]] && break
+    [[ "$attempt" -lt "$RETRY_ATTEMPTS" ]] &&
+      echo "   Not accepted yet, retrying in ${RETRY_DELAY}s ($attempt/$RETRY_ATTEMPTS)..." >&2
     sleep "$RETRY_DELAY"
   done
 
-  record_step "$label assignment at $scope" "failed" "$required" "$err"
-  echo "ERROR: could not assign role '$label' at '$scope': $err" >&2
+  # Optional roles are a warning, and the caller explains the impact.
+  if [[ "$required" == true ]]; then
+    record_step "$label assignment at $scope" "failed" "$required" "$err"
+    echo "ERROR: could not assign role '$label' at '$scope': $err" >&2
+  else
+    record_step "$label assignment at $scope" "warning" "$required" "$err"
+  fi
   return 1
 }
 
@@ -277,15 +298,17 @@ assign_role "Reader" "Reader" "$SCOPE" true
 # Reservations Reader is optional: without it, Lucidity loses only Azure
 # reservation visibility (reservation inventory and reservation-aware cost and
 # savings reporting). Assigning it requires tenant-level permission, so a
-# failure is reported as a warning and the script continues.
+# failure is reported as a warning and the script continues. It is passed by
+# name: az doesn't recognize a role ID starting with /providers/.
 if ! assign_role \
     "Reservations Reader" \
-    "/providers/Microsoft.Authorization/roleDefinitions/582fc458-8989-419f-a480-75249bc5db7e" \
+    "Reservations Reader" \
     "/providers/Microsoft.Capacity" \
     false; then
   echo "WARNING: Reservations Reader was not assigned. Lucidity will not see Azure" >&2
   echo "  reservations or reservation-aware savings. Everything else works. A tenant" >&2
   echo "  administrator with elevated access can rerun this script to add it." >&2
+  echo "  (Full Azure error is in the report.)" >&2
 fi
 
 # ---------- Guest Insights / Blob Visibility ----------
@@ -503,6 +526,7 @@ check_storage_network() {
     echo "WARNING: Lucidity's service endpoint is not enabled yet, so subnet rules are skipped." >&2
   fi
 
+  progress "Listing storage accounts and their firewall settings..."
   if ! accounts=$(az storage account list \
       --query "[].{name: name, resourceGroup: resourceGroup, location: location, kind: kind,
         publicNetworkAccess: publicNetworkAccess,
@@ -591,6 +615,7 @@ check_storage_network() {
     while IFS=$'\t' read -r op type value; do
       flag="--ip-address"
       [[ "$type" == subnet ]] && flag="--subnet"
+      progress "${name}: ${op} ${type} rule ${value}..."
       if ! err=$(az storage account network-rule "$op" -g "$rg" --account-name "$name" \
           "$flag" "$value" --only-show-errors 2>&1 >/dev/null </dev/null); then
         failures="${failures}${op} ${type} ${value}: ${err}; "
