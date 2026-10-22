@@ -5,11 +5,24 @@ set -euo pipefail
 SUBSCRIPTION_ID="<subscription-id>"
 SP_OBJECT_ID="<service-principal-object-id>"
 
+# Mode:
+#   optimization  Lucidity gets read access plus write and delete permissions
+#                 for the optimization features below. You approve this at a
+#                 prompt, or AUTO_APPROVE_OPTIMIZATION=true skips it.
+#   assessment    Read access, guest insights and blob visibility only: what
+#                 Lucidity needs to project your savings. No approval needed.
+MODE="optimization"
+AUTO_APPROVE_OPTIMIZATION=false
+
+# Optimization features (optimization mode only; ignored in assessment).
 AUTOSCALER=true
 IDLE_DISK=false
 DISK_TIERING=false
 BLOBS=true
-BLOB_VISIBILITY=true
+
+# Assessment data (both modes).
+GUEST_INSIGHTS=true    # VM Run Command, so Lucidity can collect data inside VMs
+BLOB_VISIBILITY=true   # blob inventory, read only in the lucidity-inventory container
 
 # Storage network access (used when BLOBS or BLOB_VISIBILITY is on).
 # The script checks each storage account's firewall and lists the rules
@@ -49,6 +62,33 @@ if [[ "$SUBSCRIPTION_ID" == "<"* || "$SP_OBJECT_ID" == "<"* ]]; then
   echo "ERROR: set SUBSCRIPTION_ID and SP_OBJECT_ID at the top of this script." >&2
   exit 1
 fi
+
+case "$MODE" in
+  optimization|assessment) ;;
+  *)
+    echo "ERROR: MODE must be optimization or assessment. Got: '$MODE'" >&2
+    exit 1 ;;
+esac
+
+# Assessment mode never grants optimization permissions.
+OPTIMIZATION_FEATURES_IGNORED=false
+if [[ "$MODE" == assessment ]]; then
+  if [[ "$AUTOSCALER" == true || "$IDLE_DISK" == true ||
+        "$DISK_TIERING" == true || "$BLOBS" == true ]]; then
+    OPTIMIZATION_FEATURES_IGNORED=true
+  fi
+  AUTOSCALER=false
+  IDLE_DISK=false
+  DISK_TIERING=false
+  BLOBS=false
+fi
+
+FEATURES=()
+[[ "$AUTOSCALER" == true ]] && FEATURES+=("autoscaler")
+[[ "$IDLE_DISK" == true ]] && FEATURES+=("idle disk")
+[[ "$DISK_TIERING" == true ]] && FEATURES+=("disk tiering")
+[[ "$BLOBS" == true ]] && FEATURES+=("blobs")
+FEATURE_LIST=$(IFS=,; echo "${FEATURES[*]:-}" | sed 's/,/, /g')
 
 az account show >/dev/null 2>&1 || {
   echo "ERROR: not logged in to Azure CLI. Run 'az login', then rerun." >&2
@@ -103,6 +143,8 @@ finish() {
     --arg subscriptionId "$SUBSCRIPTION_ID" \
     --arg spObjectId "$SP_OBJECT_ID" \
     --argjson rc "$rc" \
+    --arg mode "$MODE" \
+    --argjson guestInsights "$GUEST_INSIGHTS" \
     --argjson autoscaler "$AUTOSCALER" \
     --argjson idleDisk "$IDLE_DISK" \
     --argjson diskTiering "$DISK_TIERING" \
@@ -119,7 +161,9 @@ finish() {
       tenantId: $tenantId,
       subscriptionId: $subscriptionId,
       servicePrincipalObjectId: $spObjectId,
+      mode: $mode,
       features: {
+        guestInsights: $guestInsights,
         autoscaler: $autoscaler,
         idleDisk: $idleDisk,
         diskTiering: $diskTiering,
@@ -168,6 +212,48 @@ progress() {
 progress "Selecting subscription $SUBSCRIPTION_ID..."
 az account set --subscription "$SUBSCRIPTION_ID"
 TENANT_ID=$(az account show --query tenantId -o tsv)
+
+# ---------- Mode ----------
+OPTIMIZATION_ROLE="lucidity-optimize-role-$SUBSCRIPTION_ID"
+
+if [[ "$MODE" == assessment ]]; then
+  progress "Mode: assessment (read access, guest insights and blob visibility only)"
+  if [[ "$OPTIMIZATION_FEATURES_IGNORED" == true ]]; then
+    echo "   Optimization features are ignored in assessment mode." >&2
+  fi
+elif [[ ${#FEATURES[@]} -eq 0 ]]; then
+  progress "Mode: optimization, but no optimization features are selected"
+else
+  # Approval gate: nothing has been changed yet.
+  echo "" >&2
+  echo "=============================================================="  >&2
+  echo " Mode: optimization" >&2
+  echo " Lucidity will get write and delete permissions on this subscription" >&2
+  echo " for: $FEATURE_LIST." >&2
+  echo " These cover resources such as disks, snapshots, virtual machines," >&2
+  echo " resource locks and storage accounts. See the README for the full list." >&2
+  echo " For read-only assessment instead, set MODE=\"assessment\" and rerun." >&2
+  echo "=============================================================="  >&2
+  approved=false
+  if [[ "$AUTO_APPROVE_OPTIMIZATION" == true ]]; then
+    approved=true
+    echo "   Auto-approved (AUTO_APPROVE_OPTIMIZATION=true)." >&2
+  elif [[ -t 0 ]]; then
+    printf "   Grant optimization access? [y/N] " >&2
+    read -r answer || answer=""
+    [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]] && approved=true
+  else
+    echo "   No terminal to ask for approval." >&2
+  fi
+
+  if [[ "$approved" != true ]]; then
+    record_step "Optimization mode approval" "failed" true \
+      "not approved; nothing was changed. Approve at the prompt, set AUTO_APPROVE_OPTIMIZATION=true, or use MODE=assessment"
+    echo "   Optimization access not approved. Nothing was changed." >&2
+    exit 1
+  fi
+  record_step "Optimization mode approval" "ok" true "approved for: $FEATURE_LIST"
+fi
 
 # ---------- Helpers ----------
 json_array() {
@@ -312,10 +398,12 @@ fi
 # ---------- Guest Insights / Blob Visibility ----------
 GUEST_ACTIONS=$(
   {
-    cat <<'EOF'
+    if [[ "$GUEST_INSIGHTS" == true ]]; then
+      cat <<'EOF'
 Microsoft.Compute/virtualMachines/runCommand/action
 Microsoft.Compute/virtualMachineScaleSets/virtualMachines/runCommand/action
 EOF
+    fi
 
     if [[ "$BLOB_VISIBILITY" == true ]]; then
       cat <<'EOF'
@@ -324,7 +412,6 @@ Microsoft.Storage/storageAccounts/blobServices/write
 Microsoft.Storage/storageAccounts/blobServices/containers/write
 Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action
 Microsoft.Storage/storageAccounts/inventoryPolicies/delete
-Microsoft.Storage/storageAccounts/managementPolicies/delete
 EOF
     fi
   } | json_array
@@ -340,23 +427,31 @@ else
   GUEST_DATA_ACTIONS='[]'
 fi
 
-GUEST_DESCRIPTION="Lucidity guest insights: runs the Lucidity collector inside virtual machines via Run Command."
+GUEST_DESCRIPTION="Lucidity guest insights."
+if [[ "$GUEST_INSIGHTS" == true ]]; then
+  GUEST_DESCRIPTION="$GUEST_DESCRIPTION Runs the Lucidity collector inside virtual machines via Run Command."
+fi
 if [[ "$BLOB_VISIBILITY" == true ]]; then
-  GUEST_DESCRIPTION="$GUEST_DESCRIPTION Blob visibility: manages blob inventory policies, the inventory container and last-access tracking, deletes lifecycle policies, and reads blob data."
+  GUEST_DESCRIPTION="$GUEST_DESCRIPTION Blob visibility: manages blob inventory policies, the inventory container and last-access tracking, and reads blob data."
 fi
 
+# Azure rejects a role with no permissions, so skip it when both are off.
 GUEST_ROLE="lucidity-guest-insights-role-$SUBSCRIPTION_ID"
-make_role_definition \
-  "$GUEST_ROLE" \
-  "$GUEST_DESCRIPTION" \
-  "$GUEST_ACTIONS" \
-  "$GUEST_DATA_ACTIONS" \
-  "$WORK_DIR/guest-role.json"
+if [[ "$GUEST_ACTIONS" == "[]" ]]; then
+  progress "Guest insights and blob visibility are off; skipping $GUEST_ROLE"
+else
+  make_role_definition \
+    "$GUEST_ROLE" \
+    "$GUEST_DESCRIPTION" \
+    "$GUEST_ACTIONS" \
+    "$GUEST_DATA_ACTIONS" \
+    "$WORK_DIR/guest-role.json"
 
-GUEST_ROLE_ID=$(upsert_role "$GUEST_ROLE" "$WORK_DIR/guest-role.json")
-GUEST_CONDITION=""
-[[ "$BLOB_VISIBILITY" == true ]] && GUEST_CONDITION="$BLOB_READ_CONDITION"
-assign_role "$GUEST_ROLE" "$GUEST_ROLE_ID" "$SCOPE" true "$GUEST_CONDITION"
+  GUEST_ROLE_ID=$(upsert_role "$GUEST_ROLE" "$WORK_DIR/guest-role.json")
+  GUEST_CONDITION=""
+  [[ "$BLOB_VISIBILITY" == true ]] && GUEST_CONDITION="$BLOB_READ_CONDITION"
+  assign_role "$GUEST_ROLE" "$GUEST_ROLE_ID" "$SCOPE" true "$GUEST_CONDITION"
+fi
 
 # ---------- Optimization selections ----------
 OPTIMIZATION_SELECTED=false
@@ -449,14 +544,8 @@ EOF
     OPTIMIZATION_DATA_ACTIONS='[]'
   fi
 
-  FEATURES=()
-  [[ "$AUTOSCALER" == true ]] && FEATURES+=("autoscaler")
-  [[ "$IDLE_DISK" == true ]] && FEATURES+=("idle disk")
-  [[ "$DISK_TIERING" == true ]] && FEATURES+=("disk tiering")
-  [[ "$BLOBS" == true ]] && FEATURES+=("blobs")
-  OPTIMIZATION_DESCRIPTION="Lucidity optimization: write and delete permissions for $(IFS=,; echo "${FEATURES[*]}" | sed 's/,/, /g')."
+  OPTIMIZATION_DESCRIPTION="Lucidity optimization: write and delete permissions for $FEATURE_LIST."
 
-  OPTIMIZATION_ROLE="lucidity-optimize-role-$SUBSCRIPTION_ID"
   make_role_definition \
     "$OPTIMIZATION_ROLE" \
     "$OPTIMIZATION_DESCRIPTION" \
@@ -471,6 +560,25 @@ EOF
   [[ "$BLOBS" == true ]] && OPTIMIZATION_CONDITION="$BLOB_READ_CONDITION"
   assign_role "$OPTIMIZATION_ROLE" "$OPTIMIZATION_ROLE_ID" "$SCOPE" true \
     "$OPTIMIZATION_CONDITION"
+fi
+
+# Assessment mode never removes optimization access granted by an earlier
+# run; it only reports it.
+if [[ "$MODE" == assessment ]]; then
+  progress "Checking for existing optimization access..."
+  existing=""
+  if az role definition list --name "$OPTIMIZATION_ROLE" --scope "$SCOPE" \
+      --query '[0].name' -o tsv 2>/dev/null | grep -q .; then
+    existing=$(az role assignment list --assignee "$SP_OBJECT_ID" \
+      --role "$OPTIMIZATION_ROLE" --scope "$SCOPE" --query '[0].id' -o tsv 2>/dev/null || true)
+  fi
+  if [[ -n "$existing" ]]; then
+    record_step "Existing optimization access" "ok" false \
+      "$OPTIMIZATION_ROLE is still assigned from an earlier run; assessment mode does not remove it"
+    echo "" >&2
+    echo "NOTE: Lucidity already has optimization access on this subscription" >&2
+    echo "  ($OPTIMIZATION_ROLE). Assessment mode does not remove it." >&2
+  fi
 fi
 
 # ---------- Storage network access ----------

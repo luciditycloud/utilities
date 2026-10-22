@@ -5,11 +5,17 @@ It assigns built-in and custom roles to Lucidity's service principal, checks
 whether your storage firewalls will let Lucidity read blob inventory, and
 writes a report for you to send to Lucidity.
 
-Despite the file name, the script grants **more than read access** with the
-default settings: optimization features such as the autoscaler need write
-and delete permissions on disks, snapshots and VMs. See
-[What it grants](#what-it-grants) and switch off the features you don't want
-before running it.
+It has two modes:
+
+- **Optimization** (default): read access, plus write and delete
+  permissions on resources such as disks, snapshots and VMs, so Lucidity can
+  act on its recommendations. The script asks you to approve this before it
+  changes anything.
+- **Assessment**: read access, plus the data collection Lucidity needs to
+  project your savings. No write or delete permissions on your resources,
+  and no approval prompt.
+
+See [What it grants](#what-it-grants) for the details.
 
 ## Before you run it
 
@@ -43,11 +49,26 @@ SUBSCRIPTION_ID="<subscription-id>"
 SP_OBJECT_ID="<service-principal-object-id>"
 ```
 
+For assessment mode, also set:
+
+```bash
+MODE="assessment"
+```
+
 Then run it:
 
 ```bash
 ./read-only.sh
 ```
+
+In optimization mode, the script first lists the optimization features and
+asks `Grant optimization access? [y/N]`. Only `y` or `yes` continues;
+anything else stops the script before it changes anything. For unattended
+runs, set `AUTO_APPROVE_OPTIMIZATION=true`.
+
+You can move from assessment to optimization later by rerunning with
+`MODE="optimization"`. Rerunning in assessment mode does not remove
+optimization access granted earlier; the script reports it instead.
 
 The script handles one subscription per run. For several subscriptions,
 change `SUBSCRIPTION_ID` and run it again for each. Rerunning on the same
@@ -59,11 +80,14 @@ subscription is safe: roles are updated in place.
 |---|---|---|
 | `SUBSCRIPTION_ID` | — | Subscription to onboard (required) |
 | `SP_OBJECT_ID` | — | Lucidity's service principal object ID (required) |
-| `AUTOSCALER` | `true` | Disk autoscaling permissions |
-| `IDLE_DISK` | `false` | Idle disk permissions |
-| `DISK_TIERING` | `false` | Disk tiering permissions |
-| `BLOBS` | `true` | Blob optimization permissions |
-| `BLOB_VISIBILITY` | `true` | Blob inventory permissions, so Lucidity can see your blob storage |
+| `MODE` | `optimization` | `optimization` or `assessment` |
+| `AUTO_APPROVE_OPTIMIZATION` | `false` | Grant optimization access without asking |
+| `AUTOSCALER` | `true` | Disk autoscaling permissions (optimization only) |
+| `IDLE_DISK` | `false` | Idle disk permissions (optimization only) |
+| `DISK_TIERING` | `false` | Disk tiering permissions (optimization only) |
+| `BLOBS` | `true` | Blob optimization permissions (optimization only) |
+| `GUEST_INSIGHTS` | `true` | VM Run Command, so Lucidity can collect data inside VMs (both modes) |
+| `BLOB_VISIBILITY` | `true` | Blob inventory permissions, so Lucidity can see your blob storage (both modes) |
 | `STORAGE_NETWORK_CHECK` | `true` | Check storage firewalls (when `BLOBS` or `BLOB_VISIBILITY` is on) |
 | `AUTO_APPROVE_NETWORK_CHANGES` | `false` | Add the firewall rules without asking |
 | `STORAGE_ACCOUNTS` | empty | Limit the firewall check to these accounts (comma- or space-separated); empty means all |
@@ -75,12 +99,15 @@ Don't change them unless Lucidity asks you to.
 
 All assignments are on the subscription, except Reservations Reader.
 
-| Role | Purpose | When |
-|---|---|---|
-| **Reader** (built-in) | Read all resource configuration | Always |
-| **Reservations Reader** (built-in), at `/providers/Microsoft.Capacity` | Read Azure reservations | Always attempted; optional |
-| `lucidity-guest-insights-role-<sub>` | Run the Lucidity collector inside VMs and scale-set instances (Run Command). With `BLOB_VISIBILITY`: manage blob inventory policies, the inventory container and last-access tracking; delete lifecycle policies; read blob data | Always |
-| `lucidity-optimize-role-<sub>` | Write and delete permissions for the selected optimization features | When any of `AUTOSCALER`, `IDLE_DISK`, `DISK_TIERING`, `BLOBS` is on |
+| Role | Purpose | Assessment | Optimization |
+|---|---|---|---|
+| **Reader** (built-in) | Read all resource configuration | ✅ | ✅ |
+| **Reservations Reader** (built-in), at `/providers/Microsoft.Capacity` | Read Azure reservations (optional) | ✅ attempted | ✅ attempted |
+| `lucidity-guest-insights-role-<sub>` | With `GUEST_INSIGHTS`: run the Lucidity collector inside VMs and scale-set instances (Run Command). With `BLOB_VISIBILITY`: manage blob inventory policies, the inventory container and last-access tracking; read blob data | ✅ | ✅ |
+| `lucidity-optimize-role-<sub>` | Write and delete permissions for the selected optimization features | ❌ | ✅ when any of `AUTOSCALER`, `IDLE_DISK`, `DISK_TIERING`, `BLOBS` is on |
+
+The guest insights role isn't created if both `GUEST_INSIGHTS` and
+`BLOB_VISIBILITY` are off.
 
 The guest insights role is for inspection; the optimize role is for changing
 resources. Keeping them apart lets you grant one without the other.
@@ -137,7 +164,7 @@ Every run, including one that fails, ends with a summary and writes
 from. **Please send this file to your Lucidity contact.** It contains:
 
 - tenant ID, subscription ID and Lucidity's service principal object ID
-- which features were switched on
+- the mode, and which features were switched on
 - the overall status: `completed`, `completed_with_warnings` or `failed`
 - each step's result, with Azure's error message if it failed
 - each storage account's network status and what was changed
@@ -184,9 +211,8 @@ that change on Lucidity's side:
 Known gaps and decisions still pending (as of 2026-10-22):
 
 **Decisions**
-- Whether Run Command and the inventory policy write/delete permissions
-  belong in the default setup, and whether the write and delete permissions
-  granted by default (`AUTOSCALER`, `BLOBS`) should be opt-in.
+- Whether the inventory policy write/delete permissions belong in
+  assessment mode.
 - Support for management groups and several subscriptions per run; the
   script handles one subscription.
 - Whether disabled or warned subscriptions should be skipped.
@@ -212,8 +238,11 @@ Known gaps and decisions still pending (as of 2026-10-22):
 **Not yet tested in real Azure**
 - Subnet rules, including a customer storage account in a different tenant
   from Lucidity's subnet.
-- Running without a terminal, and `AUTO_APPROVE_NETWORK_CHANGES=true`.
+- Running without a terminal, `AUTO_APPROVE_NETWORK_CHANGES=true` and
+  `AUTO_APPROVE_OPTIMIZATION=true`.
 - The shorter console output for a failed Reservations Reader assignment.
+- Assessment mode, the optimization approval prompt, `GUEST_INSIGHTS=false`,
+  and detecting optimization access left from an earlier run.
 
 ## Previous version
 
