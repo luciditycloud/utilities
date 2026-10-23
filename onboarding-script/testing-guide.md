@@ -98,6 +98,11 @@ chmod +x read-only.sh
 `STORAGE_ACCOUNTS` keeps the firewall check to the test accounts, so the
 script never touches other storage accounts in the subscription.
 
+Always keep `SP_OBJECT_ID` set to the test service principal (or, in
+scenario K, `LUCIDITY_APP_ID` set to the test app). With both left as
+shipped, the script looks up **Lucidity's real** service principal, creates
+it in the test tenant if needed, and gives it the roles.
+
 Re-uploading the script resets these settings: redo this step after every
 upload.
 
@@ -380,6 +385,61 @@ az role definition list --name lucidity-guest-insights-role-$SUB --scope /subscr
 
 Afterwards: `setv BLOB_SETUP '"lucidity"'`.
 
+### K. Finding and creating the service principal
+
+The script normally finds Lucidity's service principal from Lucidity's
+application ID. To test that without involving Lucidity's real one, point
+`LUCIDITY_APP_ID` at the test app. Run this scenario last: K3 deletes and
+recreates the test service principal.
+
+**K1. Found from the application ID.**
+
+```bash
+setv LUCIDITY_APP_ID "\"$APP_ID\""
+setv SP_OBJECT_ID '""'
+./read-only.sh       # answer y
+```
+
+Expected: `>> Resolving Lucidity's service principal...`, then "Service
+principal object ID:" showing `$SP_OBJECT_ID`, and
+`[ok] Lucidity service principal` with "found from Lucidity's application
+ID".
+
+**K2. A wrong object ID falls back to the lookup.**
+
+```bash
+setv SP_OBJECT_ID '"00000000-0000-0000-0000-000000000000"'
+./read-only.sh       # answer y
+setv SP_OBJECT_ID '""'
+```
+
+Expected: a yellow "SP_OBJECT_ID … doesn't exist in this tenant" warning,
+then the same object ID as K1.
+
+**K3. Created when it's missing.** Deleting the service principal keeps its
+app registration (and the secret in `sp.json`), so the script can create it
+again:
+
+```bash
+OLD_SP_OBJECT_ID=$SP_OBJECT_ID
+az ad sp delete --id "$APP_ID"
+sleep 30
+./read-only.sh       # answer y
+SP_OBJECT_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv); echo "$SP_OBJECT_ID"
+```
+
+Expected: "Lucidity's service principal isn't in this tenant yet; creating
+it...", a new object ID (different from `$OLD_SP_OBJECT_ID`), and the role
+assignments made to it, possibly after a few "retrying" lines while Azure
+catches up with the new service principal.
+
+The assignments to the old object ID stay behind with an unknown
+principal; [cleanup](#cleanup) removes them too.
+
+Afterwards, put the defaults back:
+`setv LUCIDITY_APP_ID '"4f2c2c1f-372a-4904-b13d-11e2467679f2"'` and
+`setv SP_OBJECT_ID "\"$SP_OBJECT_ID\""`.
+
 ## Verify
 
 Run as yourself after the scenarios.
@@ -427,10 +487,16 @@ As yourself (`az account show --query user -o table` shows type `user`).
 The service principal can't remove its own access.
 
 ```bash
-# Remove every assignment of the test service principal, by ID
-az role assignment list --assignee "$SP_OBJECT_ID" --all --query "[].id" -o tsv \
-  | xargs -r az role assignment delete --ids
-az role assignment list --assignee "$SP_OBJECT_ID" --all -o table     # expect empty
+# Remove every assignment of the test service principal (and of the old one,
+# if you ran K3), by ID. Filtering by principal ID also finds assignments
+# whose service principal was deleted.
+for scope in "/subscriptions/$SUB" "/providers/Microsoft.Capacity"; do
+  az role assignment list --scope "$scope" \
+    --query "[?principalId=='$SP_OBJECT_ID' || principalId=='${OLD_SP_OBJECT_ID:-none}'].id" -o tsv \
+    | xargs -r az role assignment delete --ids
+done
+az role assignment list --scope "/subscriptions/$SUB" \
+  --query "[?principalId=='$SP_OBJECT_ID' || principalId=='${OLD_SP_OBJECT_ID:-none}']" -o table   # expect empty
 
 sleep 60   # role deletion fails until Azure catches up with the assignment deletes
 for r in lucidity-guest-insights-role-$SUB lucidity-optimize-role-$SUB; do
@@ -442,7 +508,7 @@ for r in lucidity-guest-insights-role-$MG lucidity-optimize-role-$MG; do
 done
 
 az group delete -n $RG --yes --no-wait
-az ad sp delete --id "$APP_ID"
+az ad app delete --id "$APP_ID"    # deletes the app registration and its service principal
 rm -f sp.json t.txt lucidity-onboarding-report-*.json
 ```
 

@@ -39,8 +39,14 @@ See [What it grants](#what-it-grants) for the details.
 - **Optional:** assigning *Reservations Reader* needs tenant-level rights
   (a Global Administrator with elevated access). Without them the script
   warns and carries on; Lucidity just won't see your Azure reservations.
-- From Lucidity: the **object ID of Lucidity's service principal** in your
-  tenant.
+- **Lucidity's service principal:** the script finds it in your tenant
+  from Lucidity's application ID, so your account needs to be able to read
+  service principals in Microsoft Entra ID. If it isn't in your tenant yet,
+  the script creates it, which needs permission to create service
+  principals (for example, Application Administrator). Without that, ask an
+  Entra administrator to run
+  `az ad sp create --id 4f2c2c1f-372a-4904-b13d-11e2467679f2`, then run the
+  script.
 
 ## Running it
 
@@ -51,8 +57,7 @@ wget https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/main/o
 chmod +x read-only.sh
 ```
 
-Edit the settings at the top of the file. At minimum, set where to onboard
-and Lucidity's service principal:
+Edit the settings at the top of the file. At minimum, set where to onboard:
 
 ```bash
 # Subscriptions
@@ -62,9 +67,9 @@ SCOPE_IDS="<subscription-id-1>, <subscription-id-2>"
 # or management groups
 SCOPE_TYPE="management_group"
 SCOPE_IDS="<management-group-id>"
-
-SP_OBJECT_ID="<service-principal-object-id>"
 ```
+
+Leave `SP_OBJECT_ID` empty unless Lucidity gives you an object ID.
 
 For visibility mode, also set:
 
@@ -103,7 +108,7 @@ they're off automatically when the output isn't a terminal.
 |---|---|---|
 | `SCOPE_TYPE` | `subscription` | `subscription` or `management_group` |
 | `SCOPE_IDS` | — | Subscription or management group IDs, comma- or space-separated (required) |
-| `SP_OBJECT_ID` | — | Lucidity's service principal object ID (required) |
+| `SP_OBJECT_ID` | empty | Lucidity's service principal object ID. Empty: found from Lucidity's application ID, and created if missing |
 | `MODE` | `optimization` | `optimization` or `visibility` |
 | `AUTO_APPROVE_OPTIMIZATION` | `false` | Grant optimization access without asking |
 | `AUTOSCALER` | `true` | Disk autoscaling permissions (optimization only) |
@@ -260,7 +265,8 @@ Every run, including one that fails, ends with a summary and writes
 `lucidity-onboarding-report-<timestamp>.json` to the folder you ran it
 from. **Please send this file to your Lucidity contact.** It contains:
 
-- tenant ID and Lucidity's service principal object ID
+- tenant ID and Lucidity's service principal object ID (and whether it was
+  found or created)
 - the scope type and IDs, the mode, and which features were switched on
 - whether Reservations Reader was assigned (`reservationsReader`), and
   `blobSetup`
@@ -280,8 +286,14 @@ The report contains no secrets.
 
 ## Troubleshooting
 
-- **"set SCOPE_IDS and SP_OBJECT_ID"**: edit the values at the top of the
-  script.
+- **"set SCOPE_IDS"**: edit the value at the top of the script.
+- **"your account cannot read service principals"**: ask an administrator
+  for directory read access, then rerun.
+- **"your account cannot create Lucidity's service principal"**: ask an
+  Entra administrator (for example, an Application Administrator) to run
+  the `az ad sp create` command the script prints, then rerun.
+- **"couldn't verify SP_OBJECT_ID"**: the script uses the object ID as
+  given. If role assignments then fail, empty `SP_OBJECT_ID` and rerun.
 - **"not logged in to Azure CLI"**: run `az login`, then rerun.
 - **"… must be true or false"**, **"MODE must be …"**, **"SCOPE_TYPE must
   be …"** or **"BLOB_SETUP must be …"**: fix that setting at the top of the
@@ -352,6 +364,8 @@ As of 2026-10-22.
   from Lucidity's subnet.
 - `BLOB_SETUP=script`: creating the container and turning on last access
   time tracking with the customer's credentials.
+- Finding Lucidity's service principal from its application ID, and
+  creating it when it's missing.
 - Running without a terminal, `AUTO_APPROVE_STORAGE_CHANGES=true` and
   `AUTO_APPROVE_OPTIMIZATION=true`.
 - Coloured output and the Reservations Reader warning.

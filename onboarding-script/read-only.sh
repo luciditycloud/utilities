@@ -9,7 +9,10 @@ set -euo pipefail
 #                     subscription under it, nested groups included.
 SCOPE_TYPE="subscription"
 SCOPE_IDS="<scope-id>"   # one or more, comma- or space-separated
-SP_OBJECT_ID="<service-principal-object-id>"
+# Lucidity's service principal in your tenant. Leave empty: the script finds
+# it from Lucidity's application ID, and creates it in your tenant if it isn't
+# there yet. Set it only if Lucidity gives you an object ID.
+SP_OBJECT_ID=""
 
 # Mode:
 #   optimization  Lucidity gets read access plus write and delete permissions
@@ -47,6 +50,11 @@ BLOB_SETUP="lucidity"
 STORAGE_NETWORK_CHECK=true
 AUTO_APPROVE_STORAGE_CHANGES=false
 STORAGE_ACCOUNTS=""   # names, comma- or space-separated; empty = all in the target subscriptions
+
+# ---------- Lucidity details (provided by Lucidity) ----------
+# Lucidity's application ID; its service principal in your tenant gets the
+# roles.
+LUCIDITY_APP_ID="4f2c2c1f-372a-4904-b13d-11e2467679f2"
 
 # ---------- Lucidity network details (provided by Lucidity) ----------
 # Every storage account whose firewall allows only selected networks gets
@@ -94,10 +102,11 @@ for cmd in az jq; do
   }
 done
 
-if [[ "$SCOPE_IDS" == "<"* || -z "${SCOPE_IDS//[ ,]/}" || "$SP_OBJECT_ID" == "<"* ]]; then
-  error "set SCOPE_IDS and SP_OBJECT_ID at the top of this script."
+if [[ "$SCOPE_IDS" == "<"* || -z "${SCOPE_IDS//[ ,]/}" ]]; then
+  error "set SCOPE_IDS at the top of this script."
   exit 1
 fi
+[[ "$SP_OBJECT_ID" == "<"* ]] && SP_OBJECT_ID=""
 
 case "$SCOPE_TYPE" in
   subscription|management_group) ;;
@@ -309,6 +318,70 @@ finish() {
 trap finish EXIT
 
 TENANT_ID=$(az account show --query tenantId -o tsv)
+
+# ---------- Lucidity's service principal ----------
+# Find Lucidity's service principal in your tenant, creating it from
+# Lucidity's application if it's missing. Each failure reports its actual
+# cause.
+resolve_sp() {
+  local out
+
+  # 1. An object ID was given: use it if it exists in this tenant.
+  if [[ -n "$SP_OBJECT_ID" ]]; then
+    if out=$(az ad sp show --id "$SP_OBJECT_ID" --query id -o tsv --only-show-errors 2>&1); then
+      record_step "Lucidity service principal" "ok" true "using the given object ID"
+      return 0
+    fi
+    if [[ "$out" != *ResourceNotFound* && "$out" != *"does not exist"* ]]; then
+      # Can't check (for example, no directory read access): trust the value.
+      warn "couldn't verify SP_OBJECT_ID $SP_OBJECT_ID; using it as given." \
+        "Azure CLI: $(tr '\n' ' ' <<< "$out")"
+      record_step "Lucidity service principal" "warning" false \
+        "using the given object ID without verifying it: $out"
+      return 0
+    fi
+    warn "SP_OBJECT_ID $SP_OBJECT_ID doesn't exist in this tenant." \
+      "Looking up Lucidity's service principal from its application ID instead."
+  fi
+
+  # 2. Look it up from Lucidity's application ID.
+  if ! out=$(az ad sp list --filter "appId eq '$LUCIDITY_APP_ID'" --query "[0].id" -o tsv \
+      --only-show-errors 2>&1); then
+    record_step "Lucidity service principal" "failed" true "can't read service principals: $out"
+    error "your account cannot read service principals in Microsoft Entra ID."
+    echo "  Azure CLI: $(tr '\n' ' ' <<< "$out")" >&2
+    echo "  Ask an administrator for directory read access, then rerun." >&2
+    exit 1
+  fi
+  if [[ -n "$out" ]]; then
+    SP_OBJECT_ID="$out"
+    record_step "Lucidity service principal" "ok" true "found from Lucidity's application ID"
+    return 0
+  fi
+
+  # 3. Not in this tenant yet: create it from Lucidity's application.
+  progress "Lucidity's service principal isn't in this tenant yet; creating it..."
+  if ! out=$(az ad sp create --id "$LUCIDITY_APP_ID" --query id -o tsv --only-show-errors 2>&1); then
+    record_step "Lucidity service principal" "failed" true "can't create it: $out"
+    error "your account cannot create Lucidity's service principal."
+    echo "  Azure CLI: $(tr '\n' ' ' <<< "$out")" >&2
+    echo "  Ask an Entra administrator (for example, an Application Administrator) to run:" >&2
+    echo "    az ad sp create --id $LUCIDITY_APP_ID" >&2
+    echo "  then rerun this script." >&2
+    exit 1
+  fi
+  if [[ -z "$out" ]]; then
+    record_step "Lucidity service principal" "failed" true "created, but no object ID returned"
+    error "could not resolve Lucidity's service principal. Contact Lucidity."
+    exit 1
+  fi
+  SP_OBJECT_ID="$out"
+  record_step "Lucidity service principal" "ok" true "created in this tenant"
+}
+
+progress "Resolving Lucidity's service principal..."
+resolve_sp
+echo "   Service principal object ID: $SP_OBJECT_ID" >&2
 
 # ---------- Helpers ----------
 json_array() {
