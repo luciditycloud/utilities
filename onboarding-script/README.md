@@ -1,210 +1,386 @@
 # read-only.sh
 
-A bash + Azure CLI script that onboards Lucidity's read-only assessment
-access onto an Azure tenant. It creates one **custom RBAC role per scope**
-(management group or subscription), assigns it to Lucidity's service
-principal, and — depending on the mode you pick — optionally provisions the
-storage container and access-tracking setting Lucidity's inventory needs to
-read from.
+A bash + Azure CLI script that onboards Azure subscriptions to Lucidity.
+It assigns built-in and custom roles to Lucidity's service principal, checks
+whether your storage firewalls will let Lucidity read blob inventory, and
+writes a report for you to send to Lucidity.
+
+You choose **where** to onboard:
+
+- **Subscriptions**: one or more subscription IDs.
+- **Management groups**: one or more management group IDs. Every enabled
+  subscription under each group is onboarded, including those in nested
+  groups.
+
+And **what** Lucidity gets:
+
+- **Optimization** (default): read access, plus write and delete
+  permissions on resources such as disks, snapshots and VMs, so Lucidity can
+  act on its recommendations. The script asks you to approve this before it
+  changes anything.
+- **Visibility**: read access, plus the data collection Lucidity needs to
+  project your savings. No write or delete permissions on your resources,
+  and no approval prompt.
+
+See [What it grants](#what-it-grants) for the details.
 
 ## Before you run it
 
-- Needs the **Azure CLI**, logged in (`az login`) as an identity with rights
-  to create custom role definitions and role assignments at the scope(s)
-  you're targeting:
-  - **Subscription mode (`-s`)**: Owner (or User Access Administrator +
-    a custom-role-writer role) on each subscription.
-  - **MG mode (`-m`)**: the same, but granted **at the management group**
-    — subscription-level Owner is not sufficient to create an MG-homed role
-    definition.
-- No `jq`/`python` dependency — pure bash + `az` CLI JSON/TSV parsing.
-- Provide **exactly one** of `-m` or `-s` — not both, not neither.
-- **`setup_now` makes real changes** (creates a container, flips a storage
-  setting) using your own credentials, in every account it touches. Review
-  the account list (or pass `-a` to restrict it) before confirming.
+- **Azure CLI**, logged in (`az login`), and **jq**. Azure Cloud Shell has
+  both.
+- Your account needs:
+  - **Subscriptions:** Owner on each subscription, or User Access
+    Administrator plus permission to create custom role definitions.
+  - **Management groups:** the same, **at the management group**.
+    Subscription-level Owner isn't enough to create a role at a management
+    group. You also need to be able to see the group's subscriptions.
+  - **Owner or Contributor** on storage accounts, if you approve storage
+    firewall changes.
+- **Optional:** assigning *Reservations Reader* needs tenant-level rights
+  (a Global Administrator with elevated access). Without them the script
+  warns and carries on; Lucidity just won't see your Azure reservations.
+- **Lucidity's service principal:** the script finds it in your tenant
+  from Lucidity's application ID, so your account needs to be able to read
+  service principals in Microsoft Entra ID. If it isn't in your tenant yet,
+  the script creates it, which needs permission to create service
+  principals (for example, Application Administrator). Without that, ask an
+  Entra administrator to run
+  `az ad sp create --id 4f2c2c1f-372a-4904-b13d-11e2467679f2`, then run the
+  script.
 
-## Execution
+## Running it
 
-Get the script and give it execute permission:
+Download the script:
 
 ```bash
 wget https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/main/onboarding-script/read-only.sh
 chmod +x read-only.sh
 ```
 
-The only mandatory argument is the scope — exactly one of `-m` (management
-group id) or `-s` (subscription id). Everything else has a sensible default.
-Simplest possible run, against a single subscription, default mode
-(`lucidity_self`):
+Edit the settings at the top of the file. At minimum, set where to onboard:
 
 ```bash
-./read-only.sh -s "<subscription-id>"
+# Subscriptions
+SCOPE_TYPE="subscription"
+SCOPE_IDS="<subscription-id-1>, <subscription-id-2>"
+
+# or management groups
+SCOPE_TYPE="management_group"
+SCOPE_IDS="<management-group-id>"
 ```
 
-The script prints exactly what it's about to do (role name, scope, mode,
-storage-write implications) and asks `Proceed? [y/N]` before touching
-anything. Pass `-y` to skip that prompt for unattended/CI runs.
+Leave `SP_OBJECT_ID` empty unless Lucidity gives you an object ID.
 
-See *Usage* below for management-group scoping, the other enablement modes,
-multiple scopes at once, and `--clear`.
-
-## Usage
+For visibility mode, also set:
 
 ```bash
-chmod +x read-only.sh
-
-# Simplest case: one subscription, default mode (lucidity_self — SP
-# self-provisions storage prerequisites).
-./read-only.sh -s "<sub-id>"
-
-# Multiple subscriptions in one run (comma- or space-separated).
-./read-only.sh -s "<sub-id-1>,<sub-id-2>"
-
-# Management-group scope — role is homed at the MG, assignments fan out
-# to every child subscription automatically.
-./read-only.sh -m "<mg-id>"
-
-# You provision the container + LAT yourself, right now, using this
-# script and your own az login — SP gets no storage-write permissions.
-./read-only.sh -s "<sub-id>" -e setup_now
-
-# Same as above, but restrict provisioning to specific storage accounts.
-./read-only.sh -s "<sub-id>" -e setup_now -a "acct1,acct2"
-
-# SP gets no storage-write permissions and nothing is provisioned —
-# the script prints the two az commands you need to run yourself.
-./read-only.sh -s "<sub-id>" -e customer_preprovision
-
-# Skip the confirmation prompt — for unattended/CI runs.
-./read-only.sh -s "<sub-id>" -y
-
-# Override the role-name prefix (default: lucidity-permissions-readonly).
-./read-only.sh -s "<sub-id>" -p my-custom-prefix
-
-# Remove everything this script created at a given scope — deletes
-# Lucidity's assignments first, then the role definition(s).
-./read-only.sh --clear -s "<sub-id>"
-./read-only.sh --clear -m "<mg-id>" -p my-custom-prefix -y
+MODE="visibility"
 ```
 
-### Options
+Then run it:
 
-| Flag | Default | Meaning |
+```bash
+./read-only.sh
+```
+
+The script first lists the subscriptions it found and which it will skip.
+In optimization mode it then lists the optimization features and asks
+`Grant optimization access? [y/N]`. Only `y` or `yes` continues; anything
+else stops the script before it changes anything. A run asks at most two
+questions, this one and the [storage accounts](#storage-accounts) one,
+whatever the number of subscriptions. For unattended runs, set
+`AUTO_APPROVE_OPTIMIZATION=true` and `AUTO_APPROVE_STORAGE_CHANGES=true`.
+
+Rerunning is safe: existing roles and assignments are updated in place.
+
+- **Moving from visibility to optimization:** rerun with
+  `MODE="optimization"`. Rerunning in visibility mode does not remove
+  optimization access granted earlier; the script reports it instead.
+- **New subscriptions under a management group** aren't onboarded
+  automatically. Rerun the script after adding them.
+
+Output is coloured in a terminal. Set `NO_COLOR=1` to turn colours off;
+they're off automatically when the output isn't a terminal.
+
+## Settings
+
+| Setting | Default | What it does |
 |---|---|---|
-| `-m "<mgIds>"` | — | Management group id(s), comma- or space-separated. Creates a per-MG role, assigned at MG scope (fans out to every child subscription). Exactly one of `-m` / `-s` is required. |
-| `-s "<subIds>"` | — | Subscription id(s), comma- or space-separated. Creates a per-subscription role, assigned at that subscription. Exactly one of `-m` / `-s` is required. |
-| `-e <mode>` | `lucidity_self` | Enablement mode: `lucidity_self` \| `setup_now` \| `customer_preprovision` — see the table above. |
-| `-a "<accts>"` | *(all in scope)* | Only used with `-e setup_now`. Restricts self-provisioning to these storage account names, comma- or space-separated. |
-| `-p <prefix>` | `lucidity-permissions-readonly` | Override the custom role name prefix. |
-| `-c`, `--clear` | off | Clear mode — deletes every custom role starting with the prefix at the given scope(s), and Lucidity's assignments to them. |
-| `-y`, `--yes` | off | Skip the `Proceed? [y/N]` confirmation prompt — required for unattended/CI runs. |
-| `-h`, `--help` | — | Show usage. |
+| `SCOPE_TYPE` | `subscription` | `subscription` or `management_group` |
+| `SCOPE_IDS` | — | Subscription or management group IDs, comma- or space-separated (required) |
+| `SP_OBJECT_ID` | empty | Lucidity's service principal object ID. Empty: found from Lucidity's application ID, and created if missing |
+| `MODE` | `optimization` | `optimization` or `visibility` |
+| `AUTO_APPROVE_OPTIMIZATION` | `false` | Grant optimization access without asking |
+| `AUTOSCALER` | `true` | Disk autoscaling permissions (optimization only) |
+| `IDLE_DISK` | `false` | Idle disk permissions (optimization only) |
+| `DISK_TIERING` | `false` | Disk tiering permissions (optimization only) |
+| `BLOBS` | `true` | Blob optimization permissions (optimization only) |
+| `GUEST_INSIGHTS` | `true` | VM Run Command, so Lucidity can collect data inside VMs (both modes) |
+| `BLOB_VISIBILITY` | `true` | Blob inventory permissions, so Lucidity can see your blob storage (both modes) |
+| `BLOB_SETUP` | `lucidity` | Who creates the inventory container and turns on last access time tracking: `lucidity` or `script` (see [Blob visibility setup](#blob-visibility-setup)) |
+| `STORAGE_NETWORK_CHECK` | `true` | Check storage firewalls (when `BLOBS` or `BLOB_VISIBILITY` is on) |
+| `AUTO_APPROVE_STORAGE_CHANGES` | `false` | Make the storage account changes (firewall rules, blob setup) without asking |
+| `STORAGE_ACCOUNTS` | empty | Limit the firewall check to these accounts (comma- or space-separated); empty means all in the target subscriptions |
 
-## What a run looks like
+The settings under *Lucidity network details* are provided by Lucidity.
+Don't change them unless Lucidity asks you to.
 
-```
->> Ensuring Azure CLI login...
->> Resolving Lucidity service principal...
-   Service Principal Id: 11111111-2222-3333-4444-555555555555
+## What it grants
 
-==============================================================
- About to apply (mode: lucidity_self)
-   Scope mode  : sub   targets: <sub-id>
-   Roles       : one per sub -> lucidity-permissions-readonly-sub-<sub-id> (65 actions each)
-   Assigned to : Lucidity SP 11111111-2222-3333-4444-555555555555 (always at SUBSCRIPTION scope)
-   ABAC gate   : blobs/read -> container 'lucidity-inventory'
-   Storage wr. : YES to SP (containers/write + blobServices/write, subscription-wide)
-   Provisions  : nothing (SP self-enables container + LAT)
-==============================================================
-Proceed? [y/N] y
+| Role | Purpose | Visibility | Optimization |
+|---|---|---|---|
+| **Reader** (built-in) | Read all resource configuration | ✅ | ✅ |
+| **Reservations Reader** (built-in), at `/providers/Microsoft.Capacity` | Read Azure reservations (optional, tenant-wide) | ✅ attempted | ✅ attempted |
+| `lucidity-guest-insights-role-<id>` | With `GUEST_INSIGHTS`: run the Lucidity collector inside VMs and scale-set instances (Run Command). With `BLOB_VISIBILITY`: manage blob inventory policies and read blob data; with `BLOB_SETUP=lucidity`, also create the inventory container and turn on last access time tracking | ✅ | ✅ |
+| `lucidity-optimize-role-<id>` | Write and delete permissions for the selected optimization features | ❌ | ✅ when any of `AUTOSCALER`, `IDLE_DISK`, `DISK_TIERING`, `BLOBS` is on |
 
->> [sub: <sub-id>] role 'lucidity-permissions-readonly-sub-<sub-id>' (65 actions)...
-   role id: /subscriptions/<sub-id>/providers/Microsoft.Authorization/roleDefinitions/<role-guid>
-   --- subscription <sub-id> ---
-     assigning at /subscriptions/<sub-id> ...
-       assigned (ABAC read-condition applied)
+**Where the roles live:**
 
-==============================================================
- Setup summary
-   Mode        : lucidity_self
-   Scope mode  : sub   targets: <sub-id>
-   Role naming : lucidity-permissions-readonly-sub-<sub-id>  (65 actions each)
-   ABAC gate   : blobs/read -> 'lucidity-inventory'
-   TenantId    : <tenant-id>
- Status       : COMPLETE
-==============================================================
-```
+- **Subscriptions:** each subscription gets its own custom roles, named
+  after the subscription ID.
+- **Management groups:** the custom roles are created once at each
+  management group and named after it. They're assigned on every enabled
+  subscription under it; Azure doesn't allow roles with blob data
+  permissions to be assigned at the management group itself.
+- **A subscription that already has its own Lucidity roles** (from an
+  earlier subscription-level run) keeps them in a management group run.
+  They're updated in place and the management group's roles aren't added
+  there, so nothing is removed or duplicated.
+- All assignments are on subscriptions, except Reservations Reader.
 
-## What it actually does
+**Updates only ever add permissions.** On a rerun, permissions missing from
+an existing role are added; permissions already in it are kept, even ones
+the current settings don't ask for. For example, setting
+`GUEST_INSIGHTS=false` on a rerun doesn't take Run Command away. To remove
+access, do it deliberately in Azure. The report lists what was added and
+kept.
 
-1. **Logs in** (if not already) and resolves Lucidity's service principal
-   (app id `4f2c2c1f-372a-4904-b13d-11e2467679f2`) in your tenant, creating
-   it if it doesn't exist yet.
-2. **Builds one custom role per scope you pass** — named
-   `<prefix>-mg-<mgId>` or `<prefix>-sub-<subId>` — containing:
-   - ~65 read-only control-plane actions across Compute, Networking,
-     Recovery Services (backup), Storage, Monitor/Log Analytics, Resource
-     Graph, AKS, Cost Management, and Authorization — everything Lucidity's
-     inventory needs to *look at*, nothing that lets it change anything
-     outside storage.
-   - One data-plane action, `blobs/read`, gated by an **ABAC condition**
-     that limits it to a single container named `lucidity-inventory` — so
-     even the one data-read permission granted can't see any other blob
-     data in the account.
-3. **Assigns** that role to Lucidity's service principal — always at
-   subscription scope. In MG mode, the role is homed at the management
-   group (so it lives/dies with that MG) but gets fanned out into a
-   separate assignment on every child subscription under it.
-4. **Provisions storage prerequisites**, depending on `-e` mode (see below):
-   Lucidity self-provisions, you provision now with this script using your
-   own credentials, or you provision it yourself later.
-5. **`--clear`** reverses all of it: finds every custom role starting with
-   the prefix at the scope(s) you give it, removes Lucidity's assignments
-   to each one, then deletes the role definition.
+The guest insights role isn't created if both `GUEST_INSIGHTS` and
+`BLOB_VISIBILITY` are off. It's for inspection; the optimize role is for
+changing resources. Keeping them apart lets you grant one without the
+other.
 
-Re-running the setup command is safe — existing roles are updated in place,
-and a prior assignment to the same role/scope is removed and recreated
-rather than duplicated.
+**Blob data reads are limited to the `lucidity-inventory` container.**
+Azure's blob inventory, set up by Lucidity, writes reports listing each
+blob's properties, including its last access time, into that container.
+Each custom role assignment that includes blob read carries an Azure ABAC
+condition that denies blob reads in any other container. The role's other
+permissions are unaffected.
 
-## The three enablement modes (`-e`)
+**Skipped subscriptions:** subscriptions that aren't enabled (for example
+disabled or warned), or that your account can't see, are skipped and
+listed in the report.
 
-| Mode | Storage writes on the role? | Who provisions the container + LAT? |
+## Blob visibility setup
+
+For blob visibility, each storage account needs the `lucidity-inventory`
+container and **last access time tracking** turned on. `BLOB_SETUP` decides
+who does that:
+
+- **`lucidity`** (default): Lucidity does it, so its role gets
+  `blobServices/write` (last access time tracking) and `containers/write`
+  (the container) on every storage account. Storage accounts created later
+  are set up by Lucidity automatically.
+- **`script`**: this script does it now, with **your** credentials, and
+  Lucidity's role doesn't get those two permissions. **Storage accounts
+  created later aren't set up until you rerun the script.**
+
+In both cases Lucidity keeps the inventory policy permissions
+(`inventoryPolicies/write` and `delete`): it manages the inventory policy
+itself.
+
+Things to know about `script`:
+
+- The setup is part of the [storage accounts](#storage-accounts) step and
+  its single approval prompt.
+- It applies to account kinds that support blob inventory: StorageV2,
+  BlobStorage and BlockBlobStorage. Other kinds are reported as
+  `not_supported`.
+- Setup changes aren't blocked by storage firewalls, but Lucidity still
+  needs network access to read the reports.
+- Blob optimization (`BLOBS`, optimization mode) has its own container and
+  blob service write permissions, whatever `BLOB_SETUP` is.
+- Switching an existing customer from `lucidity` to `script` doesn't take
+  the two permissions away (updates only ever add). The script highlights
+  them instead.
+
+## Storage accounts
+
+The script checks every storage account in the target subscriptions (or
+those in `STORAGE_ACCOUNTS`) for two things:
+
+- **Firewall** (`STORAGE_NETWORK_CHECK`): Lucidity reads the blob inventory
+  reports over the network. If a storage account's firewall allows only
+  selected networks, Lucidity needs rules allowing its traffic: an **IP
+  rule** for Lucidity's outbound IP, and a **subnet rule** for Lucidity's
+  subnet. Which one Azure uses depends on the account's region, and Azure
+  only accepts a subnet rule for accounts in the regions Lucidity's subnet
+  endpoint covers (currently East US, West US and West US 3). So every such
+  account gets the IP rule, and accounts in those three regions also get the
+  subnet rule. The script says which accounts get what while it runs.
+- **Blob setup** (`BLOB_SETUP=script`): the container and last access time
+  tracking (see [Blob visibility setup](#blob-visibility-setup)).
+
+Firewall status:
+
+| Status | Meaning | What happens |
 |---|---|---|
-| `lucidity_self` (default) | **Yes** — `containers/write` + `blobServices/write`, subscription-wide | Lucidity's SP does it itself, no extra step from you |
-| `setup_now` | No | **This script**, right now, using your own logged-in `az` credentials |
-| `customer_preprovision` | No | You, separately — the script prints the exact `az` commands to run |
+| `open` | Firewall allows all networks | Nothing needed |
+| `already_allowed` | Lucidity's rules are already in place | Nothing needed |
+| `needs_rule` | Firewall allows selected networks and a Lucidity rule is missing | The missing rules are added, after your approval |
+| `public_access_disabled` | Public network access is disabled | Manual: allow selected networks and rerun, or ask Lucidity about a private endpoint |
+| `network_perimeter` | Secured by a network security perimeter | Manual: add Lucidity to the perimeter's access rules |
+| `not_applicable` | File-share-only account | Nothing needed |
+| `not_found` | A name in `STORAGE_ACCOUNTS` doesn't exist | Check the name |
+| `not_checked` | `STORAGE_NETWORK_CHECK=false` | Nothing |
 
-`lucidity_self` is the simplest (nothing else to do), but it's also the only
-mode where the SP holds subscription-wide storage-write permissions — the
-ABAC condition only restricts `blobs/read`, not those write actions. If you'd
-rather Lucidity hold no write permissions at all, use `setup_now` or
-`customer_preprovision` instead.
+Blob setup status (with `BLOB_SETUP=script`):
+
+| Status | Meaning | What happens |
+|---|---|---|
+| `ready` | Container exists and tracking is on | Nothing needed |
+| `needs_setup` | Container missing or tracking off | Set up, after your approval |
+| `not_supported` | Account kind doesn't support blob inventory | Nothing |
+| `check_failed` | The script couldn't read the account's settings | Check your access; the report has Azure's error |
+| `not_requested` | `BLOB_SETUP=lucidity` | Lucidity does it |
+
+**Approval.** The script lists the planned changes for all target
+subscriptions and asks once: `Apply these changes on N storage account(s)?
+[y/N]`. Only `y` or `yes` applies them. With
+`AUTO_APPROVE_STORAGE_CHANGES=true` it applies them without asking. If
+there's no terminal to ask (for example, in a pipeline) and auto-approve is
+off, nothing is changed and the accounts are reported as
+`pending_approval`.
+
+**What it changes.** Only Lucidity's own firewall rules are added (or, after
+an IP change, the old Lucidity IP removed), plus the container and tracking
+with `BLOB_SETUP=script`. The script never changes an account's default
+action or public network access, and never touches your own rules. Changes
+are made with your credentials.
+
+Storage account problems never fail the onboarding: the roles are already in
+place by then. They make the run finish as `completed_with_warnings`
+instead.
+
+## The report
+
+Every run, including one that fails, ends with a summary and writes
+`lucidity-onboarding-report-<timestamp>.json` to the folder you ran it
+from. **Please send this file to your Lucidity contact.** It contains:
+
+- tenant ID and Lucidity's service principal object ID (and whether it was
+  found or created)
+- the scope type and IDs, the mode, and which features were switched on
+- whether Reservations Reader was assigned (`reservationsReader`), and
+  `blobSetup`
+- every subscription found: onboarded, failed or skipped (and why), and
+  whether it uses its own roles or the management group's
+- the overall status:
+  - `completed`: everything worked
+  - `completed_with_warnings`: onboarded, with something to look at
+  - `completed_with_errors`: some subscriptions or management groups
+    failed; the others were onboarded
+  - `failed`: the run stopped before onboarding anything (or partway)
+- each step's result, with Azure's error message if it failed
+- each storage account's firewall and blob setup status, and what was
+  changed (under `storage`)
+
+The report contains no secrets.
 
 ## Troubleshooting
 
-- **"could not resolve Lucidity SP. Contact Lucidity."** — your identity
-  can't create/read the service principal for that app id in this tenant.
-  Confirm you're logged into the correct tenant (`az account show`) and
-  have permission to create service principals, or ask a tenant admin to
-  do it once beforehand.
-- **"could not create/retrieve role... (MG-scoped roles need
-  roleDefinitions/write AT the MG - subscription Owner is not enough.)"** —
-  exactly what it says: grant the role-creating identity a role like Owner
-  or Role Based Access Control Administrator **at the management group
-  itself**, not just on subscriptions under it.
-- **"(no child subscriptions enumerated - check MG-reader access)"** — in
-  MG mode, the script needs Reader (or better) at the management group to
-  enumerate its child subscriptions via `az account management-group
-  entities list`. Without it, the role gets created but never assigned
-  anywhere.
-- **`ASSIGNMENT FAILED` after retries** — the script already retries role
-  assignment up to 6 times (5s apart) to absorb normal AAD replication
-  delay after creating a new role/SP. If it still fails, the printed error
-  is the real Azure CLI error — check it for a permissions or scope issue.
-- **A `setup_now` provisioning step fails on one account** — the script
-  keeps going and reports it in the per-subscription output; check that
-  your logged-in identity has write access to that specific storage
-  account (a resource lock or a Contributor-scope gap are common causes).
-- **Want to undo a run** — use `--clear` with the same scope flag(s) (and
-  `-p` if you used a custom prefix). It removes Lucidity's assignments
-  before deleting the role definitions, so nothing is left orphaned.
+- **"set SCOPE_IDS"**: edit the value at the top of the script.
+- **"your account cannot read service principals"**: ask an administrator
+  for directory read access, then rerun.
+- **"your account cannot create Lucidity's service principal"**: ask an
+  Entra administrator (for example, an Application Administrator) to run
+  the `az ad sp create` command the script prints, then rerun.
+- **"couldn't verify SP_OBJECT_ID"**: the script uses the object ID as
+  given. If role assignments then fail, empty `SP_OBJECT_ID` and rerun.
+- **"not logged in to Azure CLI"**: run `az login`, then rerun.
+- **"… must be true or false"**, **"MODE must be …"**, **"SCOPE_TYPE must
+  be …"** or **"BLOB_SETUP must be …"**: fix that setting at the top of the
+  script.
+- **"Optimization access not approved"**: nothing was changed. Rerun and
+  answer `y`, or set `MODE="visibility"`.
+- **"management group … not found"**: check the management group ID (not
+  its display name) and that your account can see it.
+- **A subscription is skipped as "not found, or your account can't access
+  it"**: your account can't see it in this tenant. Check your access, or
+  that you're logged in to the right tenant.
+- **Reservations Reader warning**: expected unless you have tenant-level
+  rights. Everything else works. A tenant administrator with elevated access
+  can rerun the script to add it.
+- **A step fails with `AuthorizationFailed`**: your account lacks the
+  permissions listed in [Before you run it](#before-you-run-it).
+- **"Lucidity's outbound IP was due to change"**: get the latest script
+  from Lucidity before approving firewall rules.
+- **Storage account reported `failed`**: often an Azure Policy blocking
+  network rule or storage changes. The report has Azure's error.
+- **Blob setup `check_failed`**: your account couldn't read that storage
+  account's settings. The report has Azure's error.
+
+## For Lucidity: testing
+
+[testing-guide.md](testing-guide.md) walks through testing the script end to
+end in a test subscription. Run it after every change to the script, and
+update it alongside this README whenever the script changes.
+
+## For Lucidity: maintaining the network details
+
+The *Lucidity network details* block at the top of the script holds values
+that change on Lucidity's side:
+
+- **Outbound IP changes:** put the new IP in `LUCIDITY_EGRESS_IPS`, move the
+  old one to `LUCIDITY_RETIRED_EGRESS_IPS`, and update
+  `LUCIDITY_EGRESS_IPS_VALID_UNTIL`. A customer rerun then adds the new rule
+  and removes the old one. After the valid-until date, runs warn that the IP
+  may be outdated.
+- **Service endpoint:** Lucidity's subnet (`LUCIDITY_SUBNET_IDS`) has a
+  Regional `Microsoft.Storage` service endpoint. With Lucidity's
+  load-balancer outbound, accounts in the regions the endpoint covers see the
+  subnet, and accounts elsewhere see the public IP. Azure rejects a subnet
+  rule on an account outside those regions (tested: "Only resources in
+  eastus, westus, westus3 can be ACL-ed to virtual networks in eastus").
+  `LUCIDITY_SUBNET_REGIONS` lists the covered regions: accounts there get
+  both rules, accounts elsewhere get the IP rule only. If Azure changes the
+  covered regions, update that list.
+- **Global service endpoint goes live:** every region then sees the subnet,
+  and IP rules stop working. Set `LUCIDITY_SUBNET_REGIONS="*"`, set
+  `LUCIDITY_EGRESS_IPS=""` and move its IPs to
+  `LUCIDITY_RETIRED_EGRESS_IPS`. A customer rerun then adds the subnet rule
+  everywhere and removes the IP rules. No code change is needed.
+
+## Open items
+
+As of 2026-10-24.
+
+**Scheduled changes**
+- Lucidity's outbound IP changes around 2026-11-16: update
+  `LUCIDITY_EGRESS_IPS`, move the old IP to `LUCIDITY_RETIRED_EGRESS_IPS`,
+  and update `LUCIDITY_EGRESS_IPS_VALID_UNTIL`.
+- Global service endpoint: switch over as described above.
+
+**Not yet tested in real Azure** (see the test log in
+[testing-guide.md](testing-guide.md))
+- Management group scope with several subscriptions or nested groups, and
+  skipping subscriptions that aren't enabled. Tested: one group with one
+  subscription, a missing group, and a group role created with data
+  permissions and assigned on the subscription.
+- Add-only role updates that actually add permissions (rerunning with
+  nothing to add is tested), and `GUEST_INSIGHTS=false`.
+- Subnet rules for a customer storage account in a **different tenant**
+  from Lucidity's subnet. Tested only within one tenant, on an East US
+  account; Azure's region restriction was found in that test.
+- The region-aware subnet rules on real accounts in covered regions other
+  than East US (West US, West US 3).
+- Creating Lucidity's service principal from its real application. Tested
+  with a test app in the same tenant; Lucidity's multi-tenant app in a
+  customer tenant is untested.
+- Running without a terminal, `AUTO_APPROVE_STORAGE_CHANGES=true` and
+  `AUTO_APPROVE_OPTIMIZATION=true`.
+
+## Previous version
+
+The earlier read-only assessment script, its `teardown.sh` and README are in
+[`legacy/`](legacy/). There is no teardown script for this version.
