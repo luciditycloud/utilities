@@ -57,8 +57,9 @@ STORAGE_ACCOUNTS=""   # names, comma- or space-separated; empty = all in the tar
 LUCIDITY_APP_ID="4f2c2c1f-372a-4904-b13d-11e2467679f2"
 
 # ---------- Lucidity network details (provided by Lucidity) ----------
-# Every storage account whose firewall allows only selected networks gets
-# both a subnet rule and an IP rule for Lucidity.
+# Every storage account whose firewall allows only selected networks gets an
+# IP rule for Lucidity, and also a subnet rule when Lucidity's subnet can reach
+# its region (LUCIDITY_SUBNET_REGIONS).
 
 # Lucidity's outbound public IP(s). SUBJECT TO CHANGE: the current IP is
 # expected to change around LUCIDITY_EGRESS_IPS_VALID_UNTIL. When it changes,
@@ -68,11 +69,15 @@ LUCIDITY_EGRESS_IPS="4.157.111.90"
 LUCIDITY_EGRESS_IPS_VALID_UNTIL="2026-11-16"
 LUCIDITY_RETIRED_EGRESS_IPS=""
 
-# Lucidity's AKS subnet. It has a Regional Microsoft.Storage service endpoint.
-# Once the Global endpoint replaces it, subnet rules cover every region: then
-# empty LUCIDITY_EGRESS_IPS and move its IPs to LUCIDITY_RETIRED_EGRESS_IPS,
-# so a rerun removes the IP rules.
+# Lucidity's AKS subnet. It has a Regional Microsoft.Storage service endpoint,
+# which Azure only lets storage accounts in LUCIDITY_SUBNET_REGIONS use: a
+# subnet rule on an account in any other region is rejected. Those accounts
+# get the IP rule only.
+# Once the Global endpoint replaces the Regional one, subnet rules cover every
+# region: set LUCIDITY_SUBNET_REGIONS="*", empty LUCIDITY_EGRESS_IPS and move
+# its IPs to LUCIDITY_RETIRED_EGRESS_IPS, so a rerun removes the IP rules.
 LUCIDITY_SUBNET_IDS="/subscriptions/3511ac94-c2ef-4644-8147-55f5f9a27a9e/resourceGroups/azurepls-rg/providers/Microsoft.Network/virtualNetworks/azurepls-vnet/subnets/aks-subnet"
+LUCIDITY_SUBNET_REGIONS="eastus westus westus3"
 
 # ---------- Output ----------
 # Colours only when both outputs are a terminal and NO_COLOR isn't set.
@@ -236,6 +241,7 @@ finish() {
     --argjson egressIps "$(to_json_list "$LUCIDITY_EGRESS_IPS")" \
     --argjson retiredEgressIps "$(to_json_list "$LUCIDITY_RETIRED_EGRESS_IPS")" \
     --argjson subnetIds "$(to_json_list "$LUCIDITY_SUBNET_IDS")" \
+    --argjson subnetRegions "$(to_json_list "$LUCIDITY_SUBNET_REGIONS")" \
     --slurpfile storage "$STORAGE_FILE" \
     '{
       generatedAt: $generatedAt,
@@ -267,6 +273,7 @@ finish() {
         lucidityEgressIps: $egressIps,
         retiredEgressIps: $retiredEgressIps,
         luciditySubnetIds: $subnetIds,
+        luciditySubnetRegions: $subnetRegions,
         accounts: $storage
       } else null end)
     }' "$STEPS_FILE")
@@ -1137,6 +1144,7 @@ check_storage() {
     --argjson ips "$(to_json_list "$LUCIDITY_EGRESS_IPS")" \
     --argjson retired "$(to_json_list "$LUCIDITY_RETIRED_EGRESS_IPS")" \
     --argjson subnets "$(to_json_list "$LUCIDITY_SUBNET_IDS")" \
+    --argjson subnetRegions "$(to_json_list "$LUCIDITY_SUBNET_REGIONS")" \
     --argjson network "$network" \
     --argjson setup "$setup" \
     --argjson kinds "$BLOB_SETUP_KINDS" \
@@ -1145,8 +1153,14 @@ check_storage() {
     def has_subnet($a; $s): ($a.vnetRules // []) | any(ascii_downcase == ($s | ascii_downcase));
     def ip_adds($a): [$ips[] | select(has_ip($a; .) | not) | {op: "add", type: "ip", value: .}];
     def ip_removals($a): [$retired[] | select(has_ip($a; .)) | {op: "remove", type: "ip", value: .}];
+    # Azure rejects a subnet rule on an account outside the regions Lucidity'"'"'s
+    # subnet endpoint covers; "*" means every region.
+    def subnet_covers($a):
+      any($subnetRegions[]; . == "*" or ascii_downcase == (($a.location // "") | ascii_downcase));
     def subnet_adds($a):
-      [$subnets[] | select(has_subnet($a; .) | not) | {op: "add", type: "subnet", value: .}];
+      if subnet_covers($a) then
+        [$subnets[] | select(has_subnet($a; .) | not) | {op: "add", type: "subnet", value: .}]
+      else [] end;
     def network_part($a; $base):
       if ($network | not) then {status: "not_checked", actions: []}
       elif $a.kind == "FileStorage" then {status: "not_applicable", actions: []}
@@ -1174,7 +1188,9 @@ check_storage() {
          defaultAction: (.defaultAction // "Allow")} as $base
       | network_part($a; $base) as $n
       | setup_part($a) as $s
-      | $base + {status: $n.status, setupStatus: $s.setupStatus, actions: ($n.actions + $s.actions)}
+      | $base + {status: $n.status, setupStatus: $s.setupStatus, actions: ($n.actions + $s.actions),
+                 subnetRuleApplies: (($subnets | length) > 0 and subnet_covers($a)),
+                 ipOnly: (($subnets | length) > 0 and ($ips | length) > 0 and (subnet_covers($a) | not))}
         + (if $s.setupDetail then {setupDetail: $s.setupDetail} else {} end);
     . as $all
     | [$all[] | classify]
@@ -1186,9 +1202,27 @@ check_storage() {
 
   echo ""
   echo "${BOLD}>> Storage accounts: $total${RESET}"
+  if [[ "$network" == true ]]; then
+    echo "   Firewall rules for Lucidity, on accounts whose firewall allows only selected networks:"
+    if [[ -n "${LUCIDITY_EGRESS_IPS//[ ,]/}" ]]; then
+      echo "   - IP rule (Lucidity's outbound IP) on every such account"
+    fi
+    if [[ -z "${LUCIDITY_SUBNET_IDS//[ ,]/}" || -z "${LUCIDITY_SUBNET_REGIONS//[ ,]/}" ]]; then
+      :
+    elif [[ "$LUCIDITY_SUBNET_REGIONS" == *"*"* ]]; then
+      echo "   - subnet rule (Lucidity's subnet) on every such account"
+    else
+      echo "   - subnet rule (Lucidity's subnet) where its service endpoint reaches:"
+      echo "     $(tr -s ' ,' ' ' <<< "$LUCIDITY_SUBNET_REGIONS")"
+      echo "     (Azure rejects a subnet rule on accounts in other regions, so they get the IP rule only)"
+    fi
+  fi
   jq -r --argjson network "$network" --argjson setup "$setup" '.[]
     | "   \(.name) [\(.location // "-")] in \(.subscriptionId // "-"): "
-      + ([(if $network or .status == "not_found" then "firewall \(.status)" else empty end),
+      + ([(if $network or .status == "not_found" then "firewall \(.status)"
+             + (if (.status == "needs_rule" or .status == "already_allowed") and .ipOnly
+                then " (IP rule only: \(.location) is outside the subnet endpoint'"'"'s regions)" else "" end)
+           else empty end),
           (if $setup and .status != "not_found" then "blob setup \(.setupStatus)" else empty end)]
          | join(", ")),
       (.actions[] | "      will "

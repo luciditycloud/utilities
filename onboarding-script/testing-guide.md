@@ -150,15 +150,20 @@ Expected:
   final summary (expected unless you have tenant-level rights).
 - Guest insights role created and assigned, with "blob reads limited to
   'lucidity-inventory'". No optimize role.
-- `>> Storage accounts: 4`, with no blob setup status (`BLOB_SETUP` is
-  `lucidity`):
+- `>> Storage accounts: 4`, then a note on which firewall rules go where
+  (the IP rule on every firewalled account; the subnet rule where
+  Lucidity's service endpoint reaches: `eastus westus westus3`), and no blob
+  setup status (`BLOB_SETUP` is `lucidity`):
   - `luctopen…`: `firewall open`
-  - `luctuk…` and `lucteast…`: `firewall needs_rule`, each with "will add
-    subnet rule …" and "will add ip rule 4.157.111.90"
+  - `lucteast…` (East US): `firewall needs_rule`, with "will add subnet
+    rule …" and "will add ip rule 4.157.111.90"
+  - `luctuk…` (UK South): `firewall needs_rule (IP rule only: uksouth is
+    outside the subnet endpoint's regions)`, with only "will add ip rule
+    4.157.111.90"
   - `luctoff…`: `firewall public_access_disabled`
 - Prompt `Apply these changes on 2 storage account(s)?`: answer `y`.
-  Both accounts become `applied`, or `failed` with Azure's error (record
-  it: a failed subnet rule means the cross-tenant subnet rule doesn't work).
+  Both accounts become `applied`. A `failed` on `lucteast…` means the
+  subnet rule didn't work: record Azure's error.
 - Final status: `completed_with_warnings` (`luctoff…`, and Reservations
   Reader if it failed).
 
@@ -171,8 +176,21 @@ for a in luctuk$SFX lucteast$SFX; do
 done
 ```
 
-Expected: the IP `4.157.111.90`, and Lucidity's subnet with state
-`Succeeded`.
+Expected: `lucteast…` has the IP `4.157.111.90` and Lucidity's subnet with
+state `Succeeded`; `luctuk…` has the IP and **no** subnet rule.
+
+Rerun the same command: both accounts are `already_allowed` (`luctuk…`
+still with the "IP rule only" note), the summary shows no storage account
+needing attention beyond `luctoff…`, and there is **no** storage prompt.
+
+**A note on the subnet rule.** Lucidity's subnet is in a different
+subscription from the test subscription, but in the **same tenant** as the
+test subscription when you use Lucidity's AKS subscription as the shipped
+script does (confirmed 2026-10-24). So this tests a cross-subscription
+rule, not a cross-tenant one. To test cross-tenant, use a test tenant
+different from the one that owns `LUCIDITY_SUBNET_IDS`, or point
+`LUCIDITY_SUBNET_IDS` at a subnet in another tenant that has a
+`Microsoft.Storage` service endpoint.
 
 ### B. Optimization mode, declined
 
@@ -534,3 +552,4 @@ Record each real-Azure test run here.
 | Date | Script commit | Tester | Scenarios | Result |
 |---|---|---|---|---|
 | 2026-10-22 | `475addc` and earlier | Swapnesh | Optimization (before modes and scopes existed): roles, rerun, condition, blob-read limit, Reservations Reader warning, IP rule, network prompt, report | Passed. Found and fixed: Reservations Reader role ID not recognized by `az`, no progress output |
+| 2026-10-24 | `3d44c68` | Swapnesh | A (visibility), B (optimization declined), C (approved), rerun over existing assignments, E (leftover optimization access), blob-read limit as the service principal; given `SP_OBJECT_ID` only | Passed, except: Azure rejects a subnet rule on a storage account outside East US, West US and West US 3 (UK South tried), so that account showed `failed` and was offered again on every run. Fixed with `LUCIDITY_SUBNET_REGIONS`; **retest pending**: rerun scenario A's storage step. Not run: I, J, K |

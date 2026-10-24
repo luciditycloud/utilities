@@ -211,10 +211,13 @@ those in `STORAGE_ACCOUNTS`) for two things:
 
 - **Firewall** (`STORAGE_NETWORK_CHECK`): Lucidity reads the blob inventory
   reports over the network. If a storage account's firewall allows only
-  selected networks, Lucidity needs rules allowing its traffic: a **subnet
-  rule** for Lucidity's subnet and an **IP rule** for Lucidity's outbound
-  IP. Which one Azure uses depends on the account's region, so both are
-  added to every such account.
+  selected networks, Lucidity needs rules allowing its traffic: an **IP
+  rule** for Lucidity's outbound IP, and a **subnet rule** for Lucidity's
+  subnet. Which one Azure uses depends on the account's region, and Azure
+  only accepts a subnet rule for accounts in the regions Lucidity's subnet
+  endpoint covers (currently East US, West US and West US 3). So every such
+  account gets the IP rule, and accounts in those three regions also get the
+  subnet rule. The script says which accounts get what while it runs.
 - **Blob setup** (`BLOB_SETUP=script`): the container and last access time
   tracking (see [Blob visibility setup](#blob-visibility-setup)).
 
@@ -335,17 +338,22 @@ that change on Lucidity's side:
   may be outdated.
 - **Service endpoint:** Lucidity's subnet (`LUCIDITY_SUBNET_IDS`) has a
   Regional `Microsoft.Storage` service endpoint. With Lucidity's
-  load-balancer outbound, accounts in Lucidity's region (and possibly its
-  paired region) see the subnet, and accounts elsewhere see the public IP.
-  So every firewalled account gets both rules.
+  load-balancer outbound, accounts in the regions the endpoint covers see the
+  subnet, and accounts elsewhere see the public IP. Azure rejects a subnet
+  rule on an account outside those regions (tested: "Only resources in
+  eastus, westus, westus3 can be ACL-ed to virtual networks in eastus").
+  `LUCIDITY_SUBNET_REGIONS` lists the covered regions: accounts there get
+  both rules, accounts elsewhere get the IP rule only. If Azure changes the
+  covered regions, update that list.
 - **Global service endpoint goes live:** every region then sees the subnet,
-  and IP rules stop working. Set `LUCIDITY_EGRESS_IPS=""` and move its IPs to
-  `LUCIDITY_RETIRED_EGRESS_IPS`. A customer rerun then removes the IP rules
-  and keeps the subnet rule. No code change is needed.
+  and IP rules stop working. Set `LUCIDITY_SUBNET_REGIONS="*"`, set
+  `LUCIDITY_EGRESS_IPS=""` and move its IPs to
+  `LUCIDITY_RETIRED_EGRESS_IPS`. A customer rerun then adds the subnet rule
+  everywhere and removes the IP rules. No code change is needed.
 
 ## Open items
 
-As of 2026-10-22.
+As of 2026-10-24.
 
 **Scheduled changes**
 - Lucidity's outbound IP changes around 2026-11-16: update
@@ -357,18 +365,19 @@ As of 2026-10-22.
 [testing-guide.md](testing-guide.md))
 - Management group scope, several subscriptions per run, and skipping
   subscriptions that aren't enabled.
-- Visibility mode, the optimization approval prompt, `GUEST_INSIGHTS=false`,
-  and detecting optimization access left from an earlier run.
-- Add-only role updates.
-- Subnet rules, including a customer storage account in a different tenant
-  from Lucidity's subnet.
+- Add-only role updates that actually add permissions (rerunning with
+  nothing to add is tested), and `GUEST_INSIGHTS=false`.
+- Subnet rules for a customer storage account in a **different tenant**
+  from Lucidity's subnet. Tested only within one tenant, on an East US
+  account; Azure's region restriction was found in that test.
+- The region-aware subnet rules (`LUCIDITY_SUBNET_REGIONS`): the script's
+  planning is tested, but not yet against real accounts in several regions.
 - `BLOB_SETUP=script`: creating the container and turning on last access
   time tracking with the customer's credentials.
 - Finding Lucidity's service principal from its application ID, and
   creating it when it's missing.
 - Running without a terminal, `AUTO_APPROVE_STORAGE_CHANGES=true` and
   `AUTO_APPROVE_OPTIMIZATION=true`.
-- Coloured output and the Reservations Reader warning.
 
 ## Previous version
 
