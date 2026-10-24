@@ -113,17 +113,24 @@ have a test management group with only test subscriptions in it; set
 `MG=<its ID>` instead.
 
 Moving a subscription into a management group changes which policies and
-role assignments it inherits. Only do this with a test subscription, and
-move it back during cleanup.
+role assignments it inherits. The commands below create the test group
+**under the subscription's current parent**, so the subscription still
+inherits everything it does today, and move the subscription back during
+cleanup. Still, only do this with a test subscription: if other people use
+it, tell them first.
 
 ```bash
 MG=lucidity-test-mg-$SFX
 ORIGINAL_PARENT=$(az account management-group entities list \
   --query "[?name=='$SUB'].parent.id | [0]" -o tsv)
 echo "ORIGINAL_PARENT=$ORIGINAL_PARENT"     # note it down: cleanup moves the subscription back here
-az account management-group create --name $MG -o none
+az account management-group create --name $MG --parent "$ORIGINAL_PARENT" -o none
 az account management-group subscription add --name $MG --subscription $SUB
 ```
+
+Creating a management group needs permission on the parent (for example
+Management Group Contributor). The creator becomes Owner of the new group,
+which is what the script needs to create roles at it.
 
 A new management group, or a subscription just moved into one, can take a
 few minutes to appear in `az account management-group entities list`. If
@@ -309,15 +316,29 @@ Expected:
 - In the report, the subscription has `"rolesAt": "subscription"`.
 
 **I2. A subscription without its own roles gets the management group's.**
-Remove the subscription-level roles first (same steps as cleanup):
+Remove the subscription-level roles first (same steps as cleanup). Filter
+by principal ID: assignments of a deleted service principal (for example
+`OLD_SP_OBJECT_ID` after K3) have no name to match.
 
 ```bash
-az role assignment list --assignee "$SP_OBJECT_ID" --scope "/subscriptions/$SUB" --query "[?starts_with(roleDefinitionName,'lucidity-')].id" -o tsv \
-  | xargs -r az role assignment delete --ids
+for p in "$SP_OBJECT_ID" "${OLD_SP_OBJECT_ID:-none}"; do
+  az role assignment list --scope "/subscriptions/$SUB" \
+    --query "[?principalId=='$p'].id" -o tsv | xargs -r az role assignment delete --ids
+done
 sleep 60
 for r in lucidity-guest-insights-role-$SUB lucidity-optimize-role-$SUB; do
   az role definition delete --name "$r" --scope "/subscriptions/$SUB"
 done
+```
+
+Azure's role listings lag behind deletes, sometimes by several minutes.
+Wait until this prints nothing before going on; if the roles still show,
+wait and rerun the deletes. Running the script too early can make it
+believe the subscription still has its own roles.
+
+```bash
+az role definition list --custom-role-only true --scope "/subscriptions/$SUB" \
+  --query "[?starts_with(roleName,'lucidity-guest-insights-role-$SUB') || starts_with(roleName,'lucidity-optimize-role-$SUB')].roleName" -o tsv
 ./read-only.sh       # answer y
 ```
 
@@ -346,6 +367,13 @@ setv SCOPE_IDS "\"$MG\""
 Expected: "management group 'no-such-mg' not found …", the real management
 group still onboarded, status `completed_with_errors`, exit code 1
 (`echo $?`).
+
+Run this some minutes after I2, once the role listings have settled. On
+2026-10-24 it was run too soon after deleting the subscription's roles: the
+script created a new subscription-level guest role but assigned the *deleted*
+role's ID, which it had looked up by name, and failed with
+`RoleDefinitionDoesNotExist`. The script now takes the ID from the creation
+command's own output.
 
 ### J. Blob setup by the script
 
@@ -552,4 +580,5 @@ Record each real-Azure test run here.
 | Date | Script commit | Tester | Scenarios | Result |
 |---|---|---|---|---|
 | 2026-10-22 | `475addc` and earlier | Swapnesh | Optimization (before modes and scopes existed): roles, rerun, condition, blob-read limit, Reservations Reader warning, IP rule, network prompt, report | Passed. Found and fixed: Reservations Reader role ID not recognized by `az`, no progress output |
-| 2026-10-24 | `3d44c68` | Swapnesh | A (visibility), B (optimization declined), C (approved), rerun over existing assignments, E (leftover optimization access), blob-read limit as the service principal; given `SP_OBJECT_ID` only | Passed, except: Azure rejects a subnet rule on a storage account outside East US, West US and West US 3 (UK South tried), so that account showed `failed` and was offered again on every run. Fixed with `LUCIDITY_SUBNET_REGIONS`; **retest pending**: rerun scenario A's storage step. Not run: I, J, K |
+| 2026-10-24 | `3d44c68` | Swapnesh | A (visibility), B (optimization declined), C (approved), rerun over existing assignments, E (leftover optimization access), blob-read limit as the service principal; given `SP_OBJECT_ID` only | Passed, except: Azure rejects a subnet rule on a storage account outside East US, West US and West US 3 (UK South tried), so that account showed `failed` and was offered again on every run. Fixed with `LUCIDITY_SUBNET_REGIONS` (retested in the next row) |
+| 2026-10-24 | `3fd3325` | Swapnesh | Storage step retest (IP rule only outside the subnet regions, no prompt on rerun); K1 (service principal found from the application ID, using a test app); K3 (created when missing); J (`BLOB_SETUP=script` on 4 accounts, including one with public access disabled; rerun clean); I1 (management group: subscription's own roles kept); I2 (role created at the group with data actions, assigned on the subscription with the condition); I3 (missing group: `completed_with_errors`, exit 1) | Passed, except: after deleting a role and recreating it within minutes, the script assigned the deleted role's ID (looked up by name from a lagging listing) and failed with `RoleDefinitionDoesNotExist`. Fixed by using the ID from the creation command; not retested in real Azure (the stale case is hard to reproduce). Subnet rule tested within one tenant only. Not run: cross-tenant subnet rule, several subscriptions or nested groups, `GUEST_INSIGHTS=false`, add-only updates that add permissions, no-terminal runs |

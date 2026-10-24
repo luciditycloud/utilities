@@ -363,19 +363,20 @@ As of 2026-10-24.
 
 **Not yet tested in real Azure** (see the test log in
 [testing-guide.md](testing-guide.md))
-- Management group scope, several subscriptions per run, and skipping
-  subscriptions that aren't enabled.
+- Management group scope with several subscriptions or nested groups, and
+  skipping subscriptions that aren't enabled. Tested: one group with one
+  subscription, a missing group, and a group role created with data
+  permissions and assigned on the subscription.
 - Add-only role updates that actually add permissions (rerunning with
   nothing to add is tested), and `GUEST_INSIGHTS=false`.
 - Subnet rules for a customer storage account in a **different tenant**
   from Lucidity's subnet. Tested only within one tenant, on an East US
   account; Azure's region restriction was found in that test.
-- The region-aware subnet rules (`LUCIDITY_SUBNET_REGIONS`): the script's
-  planning is tested, but not yet against real accounts in several regions.
-- `BLOB_SETUP=script`: creating the container and turning on last access
-  time tracking with the customer's credentials.
-- Finding Lucidity's service principal from its application ID, and
-  creating it when it's missing.
+- The region-aware subnet rules on real accounts in covered regions other
+  than East US (West US, West US 3).
+- Creating Lucidity's service principal from its real application. Tested
+  with a test app in the same tenant; Lucidity's multi-tenant app in a
+  customer tenant is untested.
 - Running without a terminal, `AUTO_APPROVE_STORAGE_CHANGES=true` and
   `AUTO_APPROVE_OPTIMIZATION=true`.
 

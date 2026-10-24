@@ -445,7 +445,7 @@ ensure_role() {
   local actions="$4"
   local data_actions="$5"
   local cache="$WORK_DIR/role-$role_name"
-  local existing merged definition err action detail added=0 kept=0 role_id="" attempt
+  local existing merged definition err action detail added=0 kept=0 role_id="" attempt created_id=""
 
   [[ -f "$cache.failed" ]] && return 1
   if [[ -f "$cache.id" ]]; then
@@ -508,16 +508,22 @@ ensure_role() {
       progress "Updating role $role_name..."
     fi
     printf '%s\n' "$definition" > "$WORK_DIR/definition.json"
-    if ! err=$(az role definition "$action" \
-        --role-definition "$WORK_DIR/definition.json" 2>&1 >/dev/null); then
+    if ! created_id=$(az role definition "$action" \
+        --role-definition "$WORK_DIR/definition.json" --query name -o tsv \
+        2>"$WORK_DIR/err"); then
+      err=$(cat "$WORK_DIR/err")
       record_step "Role definition $role_name" "failed" true "$action failed: $err"
       error "could not $action role '$role_name': $err"
       touch "$cache.failed"
       return 1
     fi
+    # Use the ID Azure just returned. Looking the role up by name instead can
+    # return a deleted role of the same name, because listings lag behind.
+    [[ "$action" == create && "$created_id" =~ ^[0-9a-fA-F-]{36}$ ]] && role_id="$created_id"
   fi
 
-  # A new role can take a short while to become visible (replication delay).
+  # Without an ID from Azure, look the role up; a new role can take a short
+  # while to become visible (replication delay).
   if [[ -z "$role_id" ]]; then
     for attempt in $(seq 1 "$RETRY_ATTEMPTS"); do
       role_id=$(az role definition list --name "$role_name" --scope "$home_scope" \
