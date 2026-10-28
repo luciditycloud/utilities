@@ -36,14 +36,8 @@ set with options on the command line.
 
 ## Running it
 
-In Azure Cloud Shell (Bash), run the script straight from this repository,
-adding the [options](#options) you need:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/main/onboarding-script/read-only.sh) --mode visibility
-```
-
-Or download it, review it, and run it:
+Download the script, review it, and run it with the [options](#options) you
+need:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/main/onboarding-script/read-only.sh
@@ -84,9 +78,12 @@ See [What it grants](#what-it-grants) for the details.
 
 ### Other options
 
-A few less common needs, such as running without prompts or doing the blob
-inventory setup with your own credentials, are covered by further options.
-Ask your Lucidity contact if you need one.
+| Option | What it does |
+|---|---|
+| `-y`, `--auto-approve` | Answer yes to every prompt, for runs without a terminal |
+| `--blob-setup script` | The script sets up blob inventory on your storage accounts with your credentials, instead of giving Lucidity's role those permissions. Storage accounts created later need a rerun |
+| `--no-guest-insights` | Don't grant VM Run Command |
+| `-h`, `--help` | Show all options |
 
 ## What happens when you run it
 
@@ -124,7 +121,7 @@ Output is coloured in a terminal. Set `NO_COLOR=1` to turn colours off.
 |---|---|---|---|
 | **Reader** (built-in) | Read all resource configuration | ✅ | ✅ |
 | **Reservations Reader** (built-in), at `/providers/Microsoft.Capacity` | Read Azure reservations (optional, tenant-wide) | ✅ attempted | ✅ attempted |
-| `lucidity-guest-insights-role-<id>` | Run the Lucidity collector inside VMs and scale-set instances (Run Command); manage blob inventory policies, create the inventory container, turn on last access time tracking, and read blob data | ✅ | ✅ |
+| `lucidity-guest-insights-role-<id>` | Run the Lucidity collector inside VMs and scale-set instances (Run Command); manage blob inventory policies, create the inventory container and turn on last access time tracking (unless `--blob-setup script`), and read blob data | ✅ | ✅ |
 | `lucidity-optimize-role-<id>` | Write and delete permissions for the selected `--features` | ❌ | ✅ |
 
 - **Where the roles live:** with subscriptions, each subscription gets its
@@ -216,7 +213,7 @@ The report contains no secrets.
 - **"not approved. Nothing was changed."**: rerun and answer `y`, or use
   `--mode visibility`.
 - **"no terminal to ask for approval"**: run the script in a terminal, such
-  as Cloud Shell.
+  as Cloud Shell, or add `--auto-approve`.
 - **"management group … not found"**: check the management group ID and
   that your account can see it.
 - **"your account cannot read service principals"** or **"cannot create
@@ -235,136 +232,5 @@ The report contains no secrets.
 
 ---
 
-## For Lucidity
-
-The rest of this page is for Lucidity's team.
-
-### Other options
-
-Not listed above, so that customers see only what most of them need. Hand
-them out when a customer asks; `--help` lists them too.
-
-| Option | What it does |
-|---|---|
-| `-y`, `--auto-approve` | Answer yes to every prompt: the subscription list, optimization access and storage changes. Needed to run without a terminal |
-| `--blob-setup script` | The script creates the `lucidity-inventory` container and turns on last access time tracking with the customer's credentials, instead of Lucidity's role getting those permissions (see below). Default `lucidity` |
-| `--no-guest-insights` | Don't grant VM Run Command |
-| `-h`, `--help` | Show all options |
-
-Defaults that have no option, such as `SP_OBJECT_ID` (an override for
-Lucidity's service principal object ID), `STORAGE_ACCOUNTS`,
-`STORAGE_NETWORK_CHECK` and `BLOB_VISIBILITY`, are set at the top of the
-script.
-
-### Blob visibility setup (`--blob-setup`)
-
-For blob visibility, each storage account needs the `lucidity-inventory`
-container and **last access time tracking** turned on.
-
-- **`lucidity`** (default): Lucidity does it, so its role gets
-  `blobServices/write` (last access time tracking) and `containers/write`
-  (the container). Storage accounts created later are set up by Lucidity
-  automatically.
-- **`script`**: the script does it now, with the customer's credentials,
-  and Lucidity's role doesn't get those two permissions. **Storage accounts
-  created later aren't set up until the customer reruns the script.**
-
-In both cases Lucidity keeps `inventoryPolicies/write` and `delete`: it
-manages the inventory policy itself. With `script`:
-
-- The setup is part of the storage accounts step and its single prompt.
-- It applies to StorageV2, BlobStorage and BlockBlobStorage accounts; other
-  kinds are reported as `not_supported`.
-- Blob optimization (`--features blobs`) has its own container and blob
-  service write permissions, whatever `--blob-setup` is.
-- Switching an existing customer from `lucidity` to `script` doesn't take
-  the two permissions away (updates only ever add). The script highlights
-  them instead.
-
-Blob setup status in the report (`setupStatus`):
-
-| Status | Meaning |
-|---|---|
-| `ready` | Container exists and tracking is on |
-| `needs_setup` | Container missing or tracking off; set up after approval |
-| `not_supported` | Account kind doesn't support blob inventory |
-| `check_failed` | The script couldn't read the account's settings; the report has Azure's error |
-| `not_requested` | `--blob-setup lucidity`: Lucidity does it |
-
-Other report values: `not_found` (a name in `STORAGE_ACCOUNTS` doesn't
-exist), `not_checked` (`STORAGE_NETWORK_CHECK=false`), and
-`pending_approval` (changes not approved, or no terminal).
-
-### Script version
-
-`SCRIPT_VERSION` at the top of the script is printed at the start of every
-run and recorded in the report. Set it to the date of each change, so a
-report shows which version a customer ran. Customers using the one-line
-command always get the latest version on `main`.
-
-### Testing
-
-[testing-guide.md](testing-guide.md) walks through testing the script end to
-end in a test subscription. Run it after every change to the script, and
-update it alongside this README whenever the script changes.
-
-### Maintaining the network details
-
-The *Lucidity network details* block at the top of the script holds values
-that change on Lucidity's side:
-
-- **Outbound IP changes:** put the new IP in `LUCIDITY_EGRESS_IPS`, move the
-  old one to `LUCIDITY_RETIRED_EGRESS_IPS`, and update
-  `LUCIDITY_EGRESS_IPS_VALID_UNTIL`. A customer rerun then adds the new rule
-  and removes the old one. After the valid-until date, runs warn that the IP
-  may be outdated.
-- **Service endpoint:** Lucidity's subnet (`LUCIDITY_SUBNET_IDS`) has a
-  Regional `Microsoft.Storage` service endpoint. With Lucidity's
-  load-balancer outbound, accounts in the regions the endpoint covers see the
-  subnet, and accounts elsewhere see the public IP. Azure rejects a subnet
-  rule on an account outside those regions (tested: "Only resources in
-  eastus, westus, westus3 can be ACL-ed to virtual networks in eastus").
-  `LUCIDITY_SUBNET_REGIONS` lists the covered regions: accounts there get
-  both rules, accounts elsewhere get the IP rule only. If Azure changes the
-  covered regions, update that list.
-- **Global service endpoint goes live:** every region then sees the subnet,
-  and IP rules stop working. Set `LUCIDITY_SUBNET_REGIONS="*"`, set
-  `LUCIDITY_EGRESS_IPS=""` and move its IPs to
-  `LUCIDITY_RETIRED_EGRESS_IPS`. A customer rerun then adds the subnet rule
-  everywhere and removes the IP rules. No code change is needed.
-
-### Open items
-
-As of 2026-10-28.
-
-**Scheduled changes**
-- Lucidity's outbound IP changes around 2026-11-16: update
-  `LUCIDITY_EGRESS_IPS`, move the old IP to `LUCIDITY_RETIRED_EGRESS_IPS`,
-  and update `LUCIDITY_EGRESS_IPS_VALID_UNTIL`.
-- Global service endpoint: switch over as described above.
-
-**Not yet tested in real Azure** (see the test log in
-[testing-guide.md](testing-guide.md))
-- The command-line options, the all-subscriptions default with its
-  confirmation, `--exclude-ids`, and the one-line `bash <(curl …)` command
-  in Cloud Shell. Tested only against a simulated Azure CLI.
-- Management group scope with several subscriptions or nested groups, and
-  skipping subscriptions that aren't enabled. Tested: one group with one
-  subscription, a missing group, and a group role created with data
-  permissions and assigned on the subscription.
-- Add-only role updates that actually add permissions (rerunning with
-  nothing to add is tested), and `--no-guest-insights`.
-- Subnet rules for a customer storage account in a **different tenant**
-  from Lucidity's subnet. Tested only within one tenant, on an East US
-  account.
-- The region-aware subnet rules on real accounts in covered regions other
-  than East US (West US, West US 3).
-- Creating Lucidity's service principal from its real application. Tested
-  with a test app in the same tenant; Lucidity's multi-tenant app in a
-  customer tenant is untested.
-- Running without a terminal, and `--auto-approve`.
-
-### Previous version
-
-The earlier read-only assessment script, its `teardown.sh` and README are in
-[`legacy/`](legacy/). There is no teardown script for this version.
+Lucidity's team: see [maintaining.md](maintaining.md) for testing and
+maintaining this script.

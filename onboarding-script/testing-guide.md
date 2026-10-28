@@ -2,7 +2,8 @@
 
 How to test [`read-only.sh`](read-only.sh) end to end in a test Azure
 tenant. Run through it after every change to the script, and update this
-guide alongside the [README](README.md) whenever the script changes.
+guide alongside the [README](README.md) and [maintaining.md](maintaining.md)
+whenever the script changes.
 
 The tests use a **throwaway service principal** in place of Lucidity's, so
 you hold its credentials and can check what it can actually do.
@@ -567,24 +568,6 @@ Expected: the second ID as `skip, not found …`, and a warning "some
 subscriptions weren't found. If those are management group IDs, rerun with
 --scope-type management_group." The test subscription is still onboarded.
 
-### M. The one-line command
-
-Run the command from the README against the branch under test. It uses the
-script as shipped, so it would target **Lucidity's real** service principal
-and every subscription: **answer `n`**, which stops it before any change.
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/$BRANCH/onboarding-script/read-only.sh) --mode visibility
-# answer n
-curl -fsSL https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/$BRANCH/onboarding-script/read-only.sh | bash -s -- --mode visibility
-# answer n
-```
-
-Expected, for both: the version line, the target list, the prompt
-`Onboard these N subscription(s)? [y/N]` waiting for your answer (in the
-piped form too), and after `n` "not approved. Nothing was changed." No
-"Resolving Lucidity's service principal" line: the run stops before it.
-
 ## Verify
 
 Run as yourself after the scenarios.
@@ -671,10 +654,6 @@ az account management-group delete --name $MG
   if it's anything other than the test service principal.
 - Delete only the roles above. The test subscription may hold other
   `lucidity-*` roles from earlier onboarding versions.
-- If scenario M was answered `y` by mistake, Lucidity's real service
-  principal was created and given roles: remove its assignments the same
-  way, filtering by its object ID
-  (`az ad sp list --filter "appId eq '4f2c2c1f-372a-4904-b13d-11e2467679f2'" --query [0].id -o tsv`).
 
 ## Test log
 
