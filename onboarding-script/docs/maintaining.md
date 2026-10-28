@@ -1,14 +1,14 @@
 # Maintaining read-only.sh (for Lucidity)
 
 Notes for Lucidity's team on testing and maintaining
-[`read-only.sh`](read-only.sh). Customer-facing documentation is in the
-[README](README.md).
+[`read-only.sh`](../read-only.sh). Customer-facing documentation is in the
+[README](../README.md).
 
 ## Keeping the docs in sync
 
 Whenever the script changes, update in the same change:
 
-- [README.md](README.md): what customers see (options, prompts, statuses,
+- [README.md](../README.md): what customers see (options, prompts, statuses,
   troubleshooting).
 - [testing-guide.md](testing-guide.md): the scenarios, expected output and
   test log.
@@ -136,4 +136,4 @@ As of 2026-10-28.
 ## Previous version
 
 The earlier read-only assessment script, its `teardown.sh` and README are in
-[`legacy/`](legacy/). There is no teardown script for this version.
+[`legacy/`](../legacy/). There is no teardown script for this version.

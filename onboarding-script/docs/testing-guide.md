@@ -1,8 +1,8 @@
 # Testing read-only.sh
 
-How to test [`read-only.sh`](read-only.sh) end to end in a test Azure
+How to test [`read-only.sh`](../read-only.sh) end to end in a test Azure
 tenant. Run through it after every change to the script, and update this
-guide alongside the [README](README.md) and [maintaining.md](maintaining.md)
+guide alongside the [README](../README.md) and [maintaining.md](maintaining.md)
 whenever the script changes.
 
 The tests use a **throwaway service principal** in place of Lucidity's, so

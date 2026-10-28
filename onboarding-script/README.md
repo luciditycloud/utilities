@@ -232,5 +232,5 @@ The report contains no secrets.
 
 ---
 
-Lucidity's team: see [maintaining.md](maintaining.md) for testing and
+Lucidity's team: see [maintaining.md](docs/maintaining.md) for testing and
 maintaining this script.
