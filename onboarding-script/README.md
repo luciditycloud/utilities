@@ -14,8 +14,9 @@ set with options on the command line.
 
 ## Before you run it
 
-- **Where to run it:** Azure Cloud Shell (Bash) is easiest. Elsewhere you
-  need the Azure CLI, logged in (`az login`), and `jq`.
+- **Where to run it:** Azure Cloud Shell (Bash) is easiest: you're already
+  logged in, and everything the script needs is installed. To run it
+  elsewhere, see [Running it outside Cloud Shell](#running-it-outside-cloud-shell).
 - **Your account needs:**
   - **Subscriptions:** Owner on each subscription, or User Access
     Administrator plus permission to create custom role definitions.
@@ -41,29 +42,39 @@ need:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/main/onboarding-script/lucidity-onboarding.sh
-bash lucidity-onboarding.sh --mode visibility
+bash lucidity-onboarding.sh --scope-ids="<mg-id-1>,<mg-id-2>" --mode=visibility     # pass comma-separated management group IDs
 ```
 
-With no options, the script onboards **every enabled subscription you can
-access** in optimization mode, after showing you the list and asking you to
-confirm it.
+### Running it outside Cloud Shell
+
+Install the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
+and [jq](https://jqlang.org/download/), then log in to your tenant and check
+you're in the right one before running the script:
+
+```bash
+az login --tenant <tenant-id>
+az account show --query "{tenant: tenantId, user: user.name}" -o table
+```
 
 ## Options
+
+Each option has a short form, and takes its value either way:
+`--mode=visibility`, `--mode visibility` or `-m visibility`.
 
 ### Access scope: where Lucidity gets access
 
 | Option | Default | What it does |
 |---|---|---|
-| `--scope-type` | `subscription` | `subscription` or `management_group` |
-| `--scope-ids` | all subscriptions | **Subscriptions:** only these subscription IDs (optional; without it, every enabled subscription you can access). **Management groups:** the management group IDs (required) |
-| `--exclude-ids` | none | Subscriptions to leave out. With management groups, also nested management groups, which leaves out every subscription under them |
+| `-t`, `--scope-type` | `management-group` | `management-group` or `subscription` |
+| `-s`, `--scope-ids` | everything you can access | **Management groups:** these management group IDs. Without it, the top management groups you can access (the tenant root group, if you can access it), after you confirm the list. **Subscriptions:** these subscription IDs. Without it, every enabled subscription you can access, after you confirm the list |
+| `-x`, `--exclude-ids` | none | Subscriptions to leave out, or nested management groups, which leaves out every subscription under them |
 
-IDs are comma-separated, for example `--exclude-ids "<id-1>,<id-2>"`.
+IDs are comma-separated, for example `--exclude-ids="<id-1>,<id-2>"`.
 
-- **Subscriptions** each get their own Lucidity roles.
 - **Management groups:** the roles are created once at each management
   group, and assigned on every enabled subscription under it, including
   those in nested groups.
+- **Subscriptions** each get their own Lucidity roles.
 - **Skipped:** disabled or warned subscriptions, and those your account
   can't see, are skipped and listed in the report.
 
@@ -71,8 +82,8 @@ IDs are comma-separated, for example `--exclude-ids "<id-1>,<id-2>"`.
 
 | Option | Default | What it does |
 |---|---|---|
-| `--mode` | `optimization` | **`optimization`:** read access, plus write and delete permissions so Lucidity can act on its recommendations. You approve this at a prompt. **`visibility`:** read access, plus the data collection Lucidity needs to project your savings. No write or delete permissions on your resources |
-| `--features` | `autoscaler,blobs` | Optimization mode only: which optimization features get write and delete permissions. Any of `autoscaler`, `blobs`, `idle_disk`, `disk_tiering`, comma-separated |
+| `-m`, `--mode` | `optimization` | **`optimization`:** read access, plus write and delete permissions so Lucidity can act on its recommendations. You approve this at a prompt. **`visibility`:** read access, plus the data collection Lucidity needs to project your savings. No write or delete permissions on your resources |
+| `-f`, `--feature-modules` | `autoscaler,blobs` | Optimization mode only: which feature modules get write and delete permissions. Any of `autoscaler`, `blobs`, `idle-disk`, `disk-tiering`, comma-separated |
 
 See [What it grants](#what-it-grants) for the details.
 
@@ -81,6 +92,7 @@ See [What it grants](#what-it-grants) for the details.
 | Option | What it does |
 |---|---|
 | `-y`, `--auto-approve` | Answer yes to every prompt, for runs without a terminal |
+| `--network-check-only` | Only check storage account firewalls and add Lucidity's rules, for when Lucidity's roles are already in place. Grants no roles. Can't be combined with the permission scope options |
 | `--blob-setup script` | The script sets up blob inventory on your storage accounts with your credentials, instead of giving Lucidity's role those permissions. Storage accounts created later need a rerun |
 | `--no-guest-insights` | Don't grant VM Run Command |
 | `-h`, `--help` | Show all options |
@@ -88,17 +100,18 @@ See [What it grants](#what-it-grants) for the details.
 ## What happens when you run it
 
 1. **Targets.** The script lists the subscriptions it found: which it will
-   onboard and which it skips (and why).
+   onboard and which it skips (and why). A management group that can't be
+   found is reported, and the others are still onboarded.
 2. **Approval.** Nothing is changed before this point.
-   - **Optimization mode:** it lists the features and asks
+   - **Optimization mode:** it lists the feature modules and asks
      `Grant optimization access? [y/N]`.
    - **No `--scope-ids`:** it asks you to confirm the subscription list. In
      optimization mode that's the same question.
    - Only `y` or `yes` continues. Anything else stops the script, with
      nothing changed.
 3. **Roles.** It creates the roles and assigns them on each subscription.
-4. **Storage accounts.** It lists the firewall rules Lucidity needs and asks
-   `Apply these changes on N storage account(s)? [y/N]`. Saying no leaves
+4. **Storage accounts.** It shows how many accounts need Lucidity's firewall
+   rules and asks `Apply these changes on N storage account(s)? [y/N]`. Saying no leaves
    them unchanged; the roles stay in place. See
    [Storage accounts](#storage-accounts).
 5. **Report.** It prints a summary and writes the [report](#the-report).
@@ -122,7 +135,7 @@ Output is coloured in a terminal. Set `NO_COLOR=1` to turn colours off.
 | **Reader** (built-in) | Read all resource configuration | ✅ | ✅ |
 | **Reservations Reader** (built-in), at `/providers/Microsoft.Capacity` | Read Azure reservations (optional, tenant-wide) | ✅ attempted | ✅ attempted |
 | `lucidity-guest-insights-role-<id>` | Run the Lucidity collector inside VMs and scale-set instances (Run Command); manage blob inventory policies, create the inventory container and turn on last access time tracking (unless `--blob-setup script`), and read blob data | ✅ | ✅ |
-| `lucidity-optimize-role-<id>` | Write and delete permissions for the selected `--features` | ❌ | ✅ |
+| `lucidity-optimize-role-<id>` | Write and delete permissions for the selected `--feature-modules` | ❌ | ✅ |
 
 - **Where the roles live:** with subscriptions, each subscription gets its
   own custom roles, named after the subscription ID. With management
@@ -157,8 +170,11 @@ allowing its traffic:
   Azure rejects the subnet rule elsewhere.
 
 The script checks every storage account in the onboarded subscriptions,
-lists the rules each one needs, and asks once before adding them. It says
-which accounts get what while it runs.
+shows how many need each rule, and asks once before adding them. The report
+lists each account's status and what was changed.
+
+Already onboarded, and only need the firewall rules (for example, after
+adding storage accounts)? Run with `--network-check-only`.
 
 | Status | Meaning | What happens |
 |---|---|---|
@@ -185,7 +201,7 @@ Every run that gets past the initial checks ends with a summary and writes
 
 - the script version and the options you ran it with,
 - the tenant ID and Lucidity's service principal object ID,
-- the scope, exclusions, mode and features,
+- the scope, exclusions, mode and feature modules,
 - every subscription found: onboarded, failed, skipped or excluded (and
   why),
 - each step's result, with Azure's error message if it failed,
@@ -203,19 +219,22 @@ The report contains no secrets.
 
 - **"unknown option", "… needs a value", "--mode must be …"**: check the
   option against [Options](#options). The script prints its usage.
-- **"--scope-type management_group needs --scope-ids"**: give the
-  management group ID (not its display name).
-- **"some subscriptions weren't found"**: check the IDs and that you're
-  logged in to the right tenant. If they're management group IDs, add
-  `--scope-type management_group`.
+- **"management group '…' not found"**: check the ID (not the display
+  name; the script prints the command that lists them), and that you're
+  logged in to the right tenant and your account can see the group. The
+  other management groups are still onboarded. Run with `-h` to see the
+  options, or contact your Lucidity representative.
+- **"not under a management group your account can access"** (without
+  `--scope-ids`): that subscription isn't onboarded. Ask someone with access
+  to its management group to run the script.
+- **"some subscriptions weren't found"** (with `--scope-type subscription`):
+  check the IDs and that you're logged in to the right tenant.
 - **"--exclude-ids: '…' matched no target subscription"**: probably a typo;
   nothing was excluded for that ID.
 - **"not approved. Nothing was changed."**: rerun and answer `y`, or use
   `--mode visibility`.
 - **"no terminal to ask for approval"**: run the script in a terminal, such
   as Cloud Shell, or add `--auto-approve`.
-- **"management group … not found"**: check the management group ID and
-  that your account can see it.
 - **"your account cannot read service principals"** or **"cannot create
   Lucidity's service principal"**: see
   [Before you run it](#before-you-run-it); the script prints the command an

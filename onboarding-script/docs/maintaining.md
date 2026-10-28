@@ -55,7 +55,7 @@ manages the inventory policy itself. With `script`:
 - The setup is part of the storage accounts step and its single prompt.
 - It applies to StorageV2, BlobStorage and BlockBlobStorage accounts; other
   kinds are reported as `not_supported`.
-- Blob optimization (`--features blobs`) has its own container and blob
+- Blob optimization (`--feature-modules blobs`) has its own container and blob
   service write permissions, whatever `--blob-setup` is.
 - Switching an existing customer from `lucidity` to `script` doesn't take
   the two permissions away (updates only ever add). The script highlights
@@ -75,6 +75,20 @@ Other storage values in the report: `not_found` (a name in
 `STORAGE_ACCOUNTS` doesn't exist), `not_checked`
 (`STORAGE_NETWORK_CHECK=false`), and `pending_approval` (changes not
 approved, or no terminal).
+
+The console shows counts only (accounts needing each rule, manual action,
+blob setup), so it stays readable with hundreds of accounts. Each account's
+status and changes are in the report's `storage.accounts`.
+
+## Network check only (`--network-check-only`)
+
+For customers whose roles are already in place but whose storage firewalls
+need Lucidity's rules (for example, new storage accounts, or after
+Lucidity's outbound IP changes). The run finds the target subscriptions as
+usual, then does only the storage firewall check and its prompt: it doesn't
+resolve or create the service principal, assign any role, or do blob setup.
+It can't be combined with `--mode`, `--feature-modules`, `--blob-setup` or
+`--no-guest-insights`. The report's `mode` is `network-check-only`.
 
 ## Network details
 
@@ -104,7 +118,7 @@ that change on Lucidity's side:
 
 ## Open items
 
-As of 2026-10-28.
+As of 2026-10-29.
 
 **Scheduled changes**
 - Lucidity's outbound IP changes around 2026-11-16: update
@@ -114,9 +128,18 @@ As of 2026-10-28.
 
 **Not yet tested in real Azure** (see the test log in
 [testing-guide.md](testing-guide.md))
-- The command-line options, the all-subscriptions default with its
-  confirmation, and `--exclude-ids`. Tested only against a simulated Azure
-  CLI.
+- Changes of 2026-10-29, tested only against a simulated Azure CLI: short
+  options, `--feature-modules`, the `management-group` default,
+  `--network-check-only`, and the count-based storage output.
+- Management group scope without `--scope-ids` (kept as a fallback, with a
+  warning, but deliberately not in the README or `--help`: customers should
+  give the management group IDs): it picks the management groups with no
+  accessible parent, using each entity's `permissions`
+  (`noaccess` means not accessible) and `parentNameChain` from
+  `az account management-group entities list`. Check those fields in a real
+  tenant, both with and without access to the tenant root group.
+- The all-subscriptions default with its confirmation (only the
+  "nothing left after exclusions" case was run in real Azure).
 - Management group scope with several subscriptions or nested groups, and
   skipping subscriptions that aren't enabled. Tested: one group with one
   subscription, a missing group, and a group role created with data
@@ -132,6 +155,9 @@ As of 2026-10-28.
   with a test app in the same tenant; Lucidity's multi-tenant app in a
   customer tenant is untested.
 - Running without a terminal, and `--auto-approve`.
+- Re-test asked for after the 2026-10-28 demo: whether the subnet rule can be
+  added on accounts outside East US, West US and West US 3. On 2026-10-24
+  Azure rejected it on a UK South account (error above).
 
 ## Previous version
 

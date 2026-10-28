@@ -28,8 +28,9 @@ reload the service principal details from `sp.json`
 ([step 5](#5-point-the-script-at-the-test-service-principal)).
 
 **Never run the script without `--scope-ids` and answer `y`, except as
-[scenario L](#l-all-subscriptions-and-exclusions) describes.** Without
-`--scope-ids` it targets every subscription you can access in the tenant.
+[scenario L](#l-all-subscriptions-and-exclusions) describes.** That targets
+every management group (or, with `--scope-type subscription`, every
+subscription) you can access in the tenant.
 
 ## Setup
 
@@ -113,11 +114,12 @@ setv STORAGE_ACCOUNTS "\"luctopen$SFX luctuk$SFX lucteast$SFX luctoff$SFX\""
 Re-uploading or re-downloading the script resets both: redo this step
 afterwards.
 
-Most scenarios run the script on the test subscription. `run` does that,
-passing any further options:
+Most scenarios run the script on the test subscription. The default scope
+type is `management-group`, so `run` passes `--scope-type subscription`
+with the test subscription, then any further options:
 
 ```bash
-run() { bash lucidity-onboarding.sh --scope-ids "$SUB" "$@"; }
+run() { bash lucidity-onboarding.sh --scope-type subscription --scope-ids "$SUB" "$@"; }
 ```
 
 ### 6. Test management group (optional)
@@ -173,22 +175,28 @@ Expected:
   final summary (expected unless you have tenant-level rights).
 - Guest insights role created and assigned, with "blob reads limited to
   'lucidity-inventory'". No optimize role.
-- `>> Storage accounts: 4`, then a note on which firewall rules go where
-  (the IP rule on every firewalled account; the subnet rule where
-  Lucidity's service endpoint reaches: `eastus westus westus3`), and no blob
-  setup status (blob setup is `lucidity`):
-  - `luctopen…`: `firewall open`
-  - `lucteast…` (East US): `firewall needs_rule`, with "will add subnet
-    rule …" and "will add ip rule 4.157.111.90"
-  - `luctuk…` (UK South): `firewall needs_rule (IP rule only: uksouth is
-    outside the subnet endpoint's regions)`, with only "will add ip rule
-    4.157.111.90"
-  - `luctoff…`: `firewall public_access_disabled`
-- Prompt `Apply these changes on 2 storage account(s)?`: answer `y`.
-  Both accounts become `applied`. A `failed` on `lucteast…` means the
-  subnet rule didn't work: record Azure's error.
+- `>> Storage accounts: 4`, with counts only (no line per account) and no
+  blob setup section (blob setup is `lucidity`):
+  ```
+     Firewall:
+     - nothing needed: 1 (open to all networks, already allowing Lucidity, or file shares only)
+     - need Lucidity's rules: 2 (IP rule: 2, subnet rule: 1)
+     - need manual action: 1 (public access disabled: 1)
+     Subnet rules go only on accounts in eastus, westus, westus3.
+     Azure rejects them in other regions, so those accounts get the IP rule only.
+     Each account's details are in the report.
+  ```
+- Prompt `Apply these changes on 2 storage account(s)?`: answer `y`. An
+  "Updating storage account N of 2..." line, then "Applied on 2, failed on
+  0." A failure means a rule didn't work: record Azure's error from the
+  report.
+- "Storage accounts that need attention: 1", with the public access
+  disabled note.
 - Final status: `completed_with_warnings` (`luctoff…`, and Reservations
   Reader if it failed).
+- In the report, `storage.accounts`: `luctopen…` `open`, `lucteast…` and
+  `luctuk…` `applied` (`luctuk…` with `ipOnly: true`), `luctoff…`
+  `public_access_disabled`.
 
 Then check the rules (both accounts):
 
@@ -202,9 +210,8 @@ done
 Expected: `lucteast…` has the IP `4.157.111.90` and Lucidity's subnet with
 state `Succeeded`; `luctuk…` has the IP and **no** subnet rule.
 
-Rerun the same command: both accounts are `already_allowed` (`luctuk…`
-still with the "IP rule only" note), the summary shows no storage account
-needing attention beyond `luctoff…`, and there is **no** storage prompt.
+Rerun the same command: "nothing needed: 3", no storage account needing
+attention beyond `luctoff…`, and **no** storage prompt.
 
 **A note on the subnet rule.** Lucidity's subnet is in a different
 subscription from the test subscription, but in the **same tenant** as the
@@ -253,10 +260,10 @@ attempt (no "retrying" lines), storage accounts `already_allowed`.
 ### E. Visibility after optimization
 
 ```bash
-run --mode visibility --features autoscaler
+run --mode visibility --feature-modules autoscaler
 ```
 
-Expected: "--features applies to optimization mode only, so it's ignored.",
+Expected: "--feature-modules applies to optimization mode only, so it's ignored.",
 then a yellow **NOTE: Lucidity already has optimization access on …**, and
 `[ok] Existing optimization access on …` in the summary. The optimize role
 is still assigned (check in [Verify](#verify)).
@@ -289,14 +296,14 @@ takes your answer.
 `| cat` makes the output a pipe:
 
 ```bash
-setsid -w bash lucidity-onboarding.sh --scope-ids "$SUB" < /dev/null 2>&1 | cat
+setsid -w bash lucidity-onboarding.sh -t subscription -s "$SUB" < /dev/null 2>&1 | cat
 ```
 
 Expected: "No terminal to ask for approval.", then "Rerun in a terminal,
 or add --auto-approve …", nothing changed, status `failed`, and no colours.
 
 ```bash
-setsid -w bash lucidity-onboarding.sh --scope-ids "$SUB" --auto-approve < /dev/null 2>&1 | cat
+setsid -w bash lucidity-onboarding.sh -t subscription -s "$SUB" --auto-approve < /dev/null 2>&1 | cat
 ```
 
 Expected: "Auto-approved (--auto-approve)." for optimization, run completes
@@ -305,22 +312,32 @@ Expected: "Auto-approved (--auto-approve)." for optimization, run completes
 ### H. Invalid options
 
 ```bash
-run --features autoscaler,foo
+run --feature-modules autoscaler,foo
 run --mode full
 run --scope-type tenant
 run --mode=visibility --bogus
+run --network-check-only --mode visibility
 bash lucidity-onboarding.sh --scope-ids
-bash lucidity-onboarding.sh --scope-type management_group
 ```
 
 Expected, each before anything is changed and followed by the usage text
 (exit code 2, `echo $?`):
-- "unknown feature in --features: 'foo' …"
+- "unknown module in --feature-modules: 'foo' …"
 - "--mode must be optimization or visibility. Got: 'full'"
-- "--scope-type must be subscription or management_group. Got: 'tenant'"
+- "--scope-type must be management-group or subscription. Got: 'tenant'"
 - "unknown option: --bogus"
+- "--network-check-only grants no roles, so it can't be combined with --mode."
 - "--scope-ids needs a value."
-- "--scope-type management_group needs --scope-ids …"
+
+**Short options.** The same as scenario A's rerun, with short options and
+both value forms:
+
+```bash
+bash lucidity-onboarding.sh -t subscription -s "$SUB" -m=visibility
+```
+
+Expected: as A's rerun, and the report's `arguments` shows the options as
+typed.
 
 Then check that the usage lists only the access and permission scope
 options, and `--help` adds "Other options":
@@ -337,11 +354,14 @@ Needs [Setup step 6](#6-test-management-group-optional).
 has subscription-level roles from the scenarios above.
 
 ```bash
-bash lucidity-onboarding.sh --scope-type management_group --scope-ids "$MG"    # answer y
+bash lucidity-onboarding.sh --scope-ids "$MG"    # answer y
 ```
 
+`management-group` is the default scope type, so no `--scope-type` is
+needed.
+
 Expected:
-- `>> Targets (management_group):` listing the test subscription under the
+- `>> Targets (management-group):` listing the test subscription under the
   management group (and any other subscriptions in it).
 - "… already has subscription-level Lucidity roles; keeping and updating
   them", and no "Creating role lucidity-…-role-$MG".
@@ -371,14 +391,14 @@ believe the subscription still has its own roles.
 ```bash
 az role definition list --custom-role-only true --scope "/subscriptions/$SUB" \
   --query "[?starts_with(roleName,'lucidity-guest-insights-role-$SUB') || starts_with(roleName,'lucidity-optimize-role-$SUB')].roleName" -o tsv
-bash lucidity-onboarding.sh --scope-type management_group --scope-ids "$MG"    # answer y
+bash lucidity-onboarding.sh --scope-ids "$MG"    # answer y
 ```
 
 Expected:
 - "Creating role lucidity-guest-insights-role-$MG…" and
   "lucidity-optimize-role-$MG…", once each, then both assigned at
   `/subscriptions/$SUB` with "blob reads limited to 'lucidity-inventory'".
-- In the report, `"rolesAt": "management_group"`.
+- In the report, `"rolesAt": "management-group"`.
 - The roles' assignable scope is the management group:
 
 ```bash
@@ -386,30 +406,33 @@ az role definition list --name lucidity-guest-insights-role-$MG \
   --scope /providers/Microsoft.Management/managementGroups/$MG --query "[0].assignableScopes"
 ```
 
+Wait some minutes after deleting roles before the next run that creates
+them, once the role listings have settled. On 2026-10-24 a run soon after
+deleting the subscription's roles created a new subscription-level guest
+role but assigned the *deleted* role's ID, which it had looked up by name,
+and failed with `RoleDefinitionDoesNotExist`. The script now takes the ID
+from the creation command's own output.
+
 **I3. Skipped and missing scopes.** If the management group has a disabled
 or warned subscription, it's listed as `skip, subscription is …` and the
-run continues. To check a missing management group:
+run continues. A missing management group is reported, and the run goes
+on with the others:
 
 ```bash
-bash lucidity-onboarding.sh --scope-type management_group --scope-ids "no-such-mg,$MG"   # answer y
+bash lucidity-onboarding.sh --scope-ids "no-such-mg,$MG"   # answer y
 ```
 
-Expected: "management group 'no-such-mg' not found …", the real management
-group still onboarded, status `completed_with_errors`, exit code 1
-(`echo $?`).
-
-Run this some minutes after I2, once the role listings have settled. On
-2026-10-24 it was run too soon after deleting the subscription's roles: the
-script created a new subscription-level guest role but assigned the *deleted*
-role's ID, which it had looked up by name, and failed with
-`RoleDefinitionDoesNotExist`. The script now takes the ID from the creation
-command's own output.
+Expected: "management group 'no-such-mg' not found, or your account can't
+access it.", the `az account management-group list` command, "Run with -h
+to see all options, or contact your Lucidity representative.", the real
+management group still onboarded, status `completed_with_errors` with
+`[failed] Management group no-such-mg`, exit code 1 (`echo $?`).
 
 **I4. Excluding a subscription under the group.** If the test subscription
 is the only one in the group, nothing is left to onboard:
 
 ```bash
-bash lucidity-onboarding.sh --scope-type management_group --scope-ids "$MG" --exclude-ids "$SUB"
+bash lucidity-onboarding.sh --scope-ids "$MG" --exclude-ids "$SUB"
 ```
 
 Expected: the test subscription listed as `skip, excluded by
@@ -438,14 +461,17 @@ Expected:
   --blob-setup script does not remove them**, and
   `[ok] Blob setup permissions in …` in the summary. The permissions are
   kept. Ran I2: "Creating role lucidity-guest-insights-role-…" and no NOTE.
-- `>> Checking blob setup on …` for each storage account, then each account
-  shows both statuses, for example `firewall already_allowed, blob setup
-  needs_setup`, with "will create container lucidity-inventory" and "will
-  enable last access time tracking". `luctopen…` already has the container
-  (from setup step 3), so it only needs tracking.
-- `luctoff…` (public access disabled) is still set up: these are management
-  operations.
-- After `y`, the accounts become `applied`.
+- `>> Checking blob setup on 4 storage account(s)...`, then after the
+  firewall counts:
+  ```
+     Blob setup:
+     - ready: 0
+     - need setup: 4 (create the lucidity-inventory container: 3, enable last access time tracking: 4)
+  ```
+  `luctopen…` already has the container (from setup step 3), so it only
+  needs tracking. `luctoff…` (public access disabled) is still set up:
+  these are management operations.
+- After `y`, "Applied on 4, failed on 0."
 
 Check the result on one account:
 
@@ -454,8 +480,7 @@ az storage account blob-service-properties show -g $RG -n luctuk$SFX --query las
 az storage container-rm exists -g $RG --storage-account luctuk$SFX -n lucidity-inventory --query exists             # expect true
 ```
 
-Rerun: every account shows `blob setup ready` and nothing is planned for
-the setup.
+Rerun: "ready: 4", "need setup: 0", and no storage prompt.
 
 **J2. A fresh role without the two permissions.** If you skipped I, remove
 the subscription's roles as in I2, then rerun. (If you ran I2, the role
@@ -532,7 +557,7 @@ all of them. A made-up ID is excluded too, to check the typo warning.
 ```bash
 OTHERS=$(az account list --query "[?tenantId=='$(az account show --query tenantId -o tsv)' && id!='$SUB'].id" -o tsv | paste -sd,)
 echo "excluding: ${OTHERS:-none}"
-bash lucidity-onboarding.sh --mode visibility --exclude-ids "${OTHERS:+$OTHERS,}no-such-sub"
+bash lucidity-onboarding.sh --scope-type subscription --mode visibility --exclude-ids "${OTHERS:+$OTHERS,}no-such-sub"
 ```
 
 Expected:
@@ -552,11 +577,41 @@ In optimization mode the same confirmation is folded into the optimization
 question:
 
 ```bash
-bash lucidity-onboarding.sh --exclude-ids "${OTHERS:+$OTHERS,}no-such-sub"      # answer n
+bash lucidity-onboarding.sh --scope-type subscription --exclude-ids "${OTHERS:+$OTHERS,}no-such-sub"      # answer n
 ```
 
 Expected: `Grant optimization access on these 1 subscription(s)? [y/N]`,
 and after `n`, nothing changed.
+
+**All management groups.** Without `--scope-ids`, the script uses the top
+management groups you can access: the tenant root group if you can access
+it, otherwise the highest groups you can see. First check what Azure
+returns, since the script relies on each group's `permissions` and
+`parentNameChain`:
+
+```bash
+az account management-group entities list \
+  --query "[?type=='Microsoft.Management/managementGroups'].{name: name, permissions: permissions, parents: join('/', parentNameChain || \`[]\`)}" -o table
+```
+
+Then run it and **answer `n`**, because this targets every subscription
+under those groups:
+
+```bash
+bash lucidity-onboarding.sh --mode visibility      # answer n
+```
+
+Expected:
+- A yellow warning: "no --scope-ids given, so this uses the top management
+  groups you can access: … Giving the management group IDs with
+  --scope-ids is recommended."
+- `>> Targets: every management group you can access in tenant … (top
+  level: …)`, naming the groups with no accessible parent in the table
+  above.
+- Every subscription under them listed, and any enabled subscription you
+  can access outside them as `skip, not under a management group your
+  account can access`.
+- `Onboard these N subscription(s)? [y/N]`; after `n`, nothing changed.
 
 A management group ID given as a subscription:
 
@@ -565,8 +620,31 @@ run --scope-ids "$SUB,${MG:-some-mg}" --mode visibility
 ```
 
 Expected: the second ID as `skip, not found …`, and a warning "some
-subscriptions weren't found. If those are management group IDs, rerun with
---scope-type management_group." The test subscription is still onboarded.
+subscriptions weren't found. If those are management group IDs, rerun
+without --scope-type subscription." The test subscription is still
+onboarded.
+
+### M. Network check only
+
+For a customer whose roles are in place and who only needs the firewall
+rules. Remove Lucidity's IP rule from one account first, so there is
+something to add:
+
+```bash
+az storage account network-rule remove -g $RG --account-name luctuk$SFX --ip-address 4.157.111.90 -o none
+run --network-check-only      # answer y
+```
+
+Expected:
+- The targets listed as `check` instead of `onboard`, then ">> Network
+  check only: no roles are granted …", and no optimization prompt.
+- No "Resolving Lucidity's service principal", Reservations Reader or role
+  steps.
+- "need Lucidity's rules: 1 (IP rule: 1, subnet rule: 0)", the prompt
+  `Apply these changes on 1 storage account(s)?`, then "Applied on 1".
+- No blob setup section, even if earlier runs used `--blob-setup script`.
+- In the report, `"mode": "network-check-only"` and an empty
+  `servicePrincipalObjectId`.
 
 ## Verify
 
@@ -618,11 +696,14 @@ The service principal can't remove its own access.
 # Remove every assignment of the test service principal (and of the old one,
 # if you ran K3), by ID. Filtering by principal ID also finds assignments
 # whose service principal was deleted.
-for scope in "/subscriptions/$SUB" "/providers/Microsoft.Capacity"; do
-  az role assignment list --scope "$scope" \
-    --query "[?principalId=='$SP_OBJECT_ID' || principalId=='${OLD_SP_OBJECT_ID:-none}'].id" -o tsv \
-    | xargs -r az role assignment delete --ids
-done
+az role assignment list --scope "/subscriptions/$SUB" \
+  --query "[?principalId=='$SP_OBJECT_ID' || principalId=='${OLD_SP_OBJECT_ID:-none}'].id" -o tsv \
+  | xargs -r az role assignment delete --ids
+# Only if Reservations Reader was assigned ([ok] in a run): needs tenant-level
+# rights, and fails with AuthorizationFailed without them.
+az role assignment list --scope "/providers/Microsoft.Capacity" \
+  --query "[?principalId=='$SP_OBJECT_ID' || principalId=='${OLD_SP_OBJECT_ID:-none}'].id" -o tsv \
+  | xargs -r az role assignment delete --ids
 az role assignment list --scope "/subscriptions/$SUB" \
   --query "[?principalId=='$SP_OBJECT_ID' || principalId=='${OLD_SP_OBJECT_ID:-none}']" -o table   # expect empty
 
@@ -658,10 +739,13 @@ az account management-group delete --name $MG
 ## Test log
 
 Record each real-Azure test run here. Runs before 2026-10-28 edited the
-settings in the file; the scenarios are otherwise the same.
+settings in the file. Runs on 2026-10-28 used `--features`, and
+`subscription` was the default scope type. The scenarios are otherwise the
+same.
 
 | Date | Script commit | Tester | Scenarios | Result |
 |---|---|---|---|---|
 | 2026-10-22 | `475addc` and earlier | Swapnesh | Optimization (before modes and scopes existed): roles, rerun, condition, blob-read limit, Reservations Reader warning, IP rule, network prompt, report | Passed. Found and fixed: Reservations Reader role ID not recognized by `az`, no progress output |
 | 2026-10-24 | `3d44c68` | Swapnesh | A (visibility), B (optimization declined), C (approved), rerun over existing assignments, E (leftover optimization access), blob-read limit as the service principal; given `SP_OBJECT_ID` only | Passed, except: Azure rejects a subnet rule on a storage account outside East US, West US and West US 3 (UK South tried), so that account showed `failed` and was offered again on every run. Fixed with `LUCIDITY_SUBNET_REGIONS` (retested in the next row) |
 | 2026-10-24 | `3fd3325` | Swapnesh | Storage step retest (IP rule only outside the subnet regions, no prompt on rerun); K1 (service principal found from the application ID, using a test app); K3 (created when missing); J (`BLOB_SETUP=script` on 4 accounts, including one with public access disabled; rerun clean); I1 (management group: subscription's own roles kept); I2 (role created at the group with data actions, assigned on the subscription with the condition); I3 (missing group: `completed_with_errors`, exit 1) | Passed, except: after deleting a role and recreating it within minutes, the script assigned the deleted role's ID (looked up by name from a lagging listing) and failed with `RoleDefinitionDoesNotExist`. Fixed by using the ID from the creation command; not retested in real Azure (the stale case is hard to reproduce). Subnet rule tested within one tenant only. Not run: cross-tenant subnet rule, several subscriptions or nested groups, `GUEST_INSIGHTS=false`, add-only updates that add permissions, no-terminal runs |
+| 2026-10-28 | `edd870f` | Swapnesh | Options in real Azure: A (visibility with `--scope-ids`, no list prompt; `--opt=value` form), storage prompt declined, `--exclude-ids` leaving nothing (`failed`, nothing changed), J (`--blob-setup=script` on 4 accounts: container and tracking set, East US IP and subnet rules `Succeeded`, UK South IP rule only, public-access-disabled account reported), B (declined, nothing changed), C (approved with `--features=autoscaler`: optimize role with autoscaler only), rerun (`ready` / `already_allowed`), report `arguments`. Then a live demo to the sales team (visibility mode) | Passed. Reservations Reader `AuthorizationFailed` as expected without tenant rights. Cleanup's `/providers/Microsoft.Capacity` assignment list fails the same way; Cleanup now runs it only if Reservations Reader was assigned |
