@@ -16,13 +16,19 @@ you hold its credentials and can check what it can actually do.
   one, [Setup step 6](#6-test-management-group-optional) creates one.
 - Permission to create app registrations in the tenant (most users have it
   unless an admin turned it off).
-- **Azure Cloud Shell in Bash mode** (not PowerShell). It has `az` and `jq`.
+- **Azure Cloud Shell in Bash mode** (not PowerShell). It has `az`, `jq`,
+  `curl` and `setsid`.
 - The version of `read-only.sh` you want to test.
 
 Keep the same Cloud Shell session for the whole test: the steps share shell
-variables. If the session restarts, redo [Setup step 1](#1-variables) and
+variables. If the session restarts, redo [Setup step 1](#1-variables),
 reload the service principal details from `sp.json`
-([step 2](#2-throwaway-service-principal)).
+([step 2](#2-throwaway-service-principal)) and redefine `run`
+([step 5](#5-point-the-script-at-the-test-service-principal)).
+
+**Never run the script without `--scope-ids` and answer `y`, except as
+[scenario L](#l-all-subscriptions-and-exclusions) describes.** Without
+`--scope-ids` it targets every subscription you can access in the tenant.
 
 ## Setup
 
@@ -78,33 +84,40 @@ Either upload it (Cloud Shell: **Manage files → Upload**), or download it
 from the branch under test:
 
 ```bash
-wget -O read-only.sh https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/<branch>/onboarding-script/read-only.sh
+BRANCH=<branch>
+curl -fsSLo read-only.sh https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/$BRANCH/onboarding-script/read-only.sh
+bash read-only.sh --help | head -1     # shows the script version
 ```
 
-### 5. Fill in the settings
+### 5. Point the script at the test service principal
 
-`setv` changes one setting in place and prints the result:
+Two settings have no option, so they're edited in the file. `setv` changes
+one setting in place and prints the result:
 
 ```bash
 setv() { sed -i "s|^$1=.*|$1=$2|" read-only.sh; grep "^$1=" read-only.sh; }
 
-setv SCOPE_TYPE '"subscription"'
-setv SCOPE_IDS "\"$SUB\""
 setv SP_OBJECT_ID "\"$SP_OBJECT_ID\""
 setv STORAGE_ACCOUNTS "\"luctopen$SFX luctuk$SFX lucteast$SFX luctoff$SFX\""
-chmod +x read-only.sh
 ```
 
-`STORAGE_ACCOUNTS` keeps the firewall check to the test accounts, so the
-script never touches other storage accounts in the subscription.
+- `SP_OBJECT_ID` makes the script use the test service principal. Always
+  keep it set (or, in scenario K, `LUCIDITY_APP_ID` set to the test app).
+  With both left as shipped, the script looks up **Lucidity's real**
+  service principal, creates it in the test tenant if needed, and gives it
+  the roles.
+- `STORAGE_ACCOUNTS` keeps the storage check to the test accounts, so the
+  script never touches other storage accounts in the subscription.
 
-Always keep `SP_OBJECT_ID` set to the test service principal (or, in
-scenario K, `LUCIDITY_APP_ID` set to the test app). With both left as
-shipped, the script looks up **Lucidity's real** service principal, creates
-it in the test tenant if needed, and gives it the roles.
+Re-uploading or re-downloading the script resets both: redo this step
+afterwards.
 
-Re-uploading the script resets these settings: redo this step after every
-upload.
+Most scenarios run the script on the test subscription. `run` does that,
+passing any further options:
+
+```bash
+run() { bash read-only.sh --scope-ids "$SUB" "$@"; }
+```
 
 ### 6. Test management group (optional)
 
@@ -140,18 +153,20 @@ scenario I lists no subscriptions, wait and rerun.
 
 Run them in order: later scenarios build on the state earlier ones leave.
 After each run, compare with the expected result and note anything
-different. All runs should show coloured output in Cloud Shell.
+different. All runs should show coloured output in Cloud Shell, and start
+with `>> Lucidity onboarding script, version …`.
 
 ### A. Visibility mode
 
 ```bash
-setv MODE '"visibility"'
-./read-only.sh
+run --mode visibility
 ```
 
 Expected:
 - `>> Targets (subscription):` listing the test subscription as `onboard`,
-  then a progress line for each step, and no optimization approval prompt.
+  and no approval prompt.
+- `>> Resolving Lucidity's service principal...` with the test service
+  principal's object ID, then a progress line for each step.
 - Reader: `[ok]`. Reservations Reader: either `[ok]`, or `[warning]` with a
   yellow warning block, repeated as "Reservations Reader is missing" in the
   final summary (expected unless you have tenant-level rights).
@@ -160,7 +175,7 @@ Expected:
 - `>> Storage accounts: 4`, then a note on which firewall rules go where
   (the IP rule on every firewalled account; the subnet rule where
   Lucidity's service endpoint reaches: `eastus westus westus3`), and no blob
-  setup status (`BLOB_SETUP` is `lucidity`):
+  setup status (blob setup is `lucidity`):
   - `luctopen…`: `firewall open`
   - `lucteast…` (East US): `firewall needs_rule`, with "will add subnet
     rule …" and "will add ip rule 4.157.111.90"
@@ -202,19 +217,19 @@ different from the one that owns `LUCIDITY_SUBNET_IDS`, or point
 ### B. Optimization mode, declined
 
 ```bash
-setv MODE '"optimization"'
-./read-only.sh       # answer n
+run       # answer n
 ```
 
 Expected: the approval banner says "1 subscription(s)" and lists
-"autoscaler, blobs"; after `n`, a red "optimization access not approved.
-Nothing was changed." and status `failed` with
-`[failed] Optimization mode approval`. No role was changed.
+"autoscaler, blobs"; after `n`, a red "not approved. Nothing was changed."
+with "Approve at the prompt, or rerun with --mode visibility.", and status
+`failed` with `[failed] Optimization mode approval`. No role was changed,
+and the run didn't get as far as resolving the service principal.
 
 ### C. Optimization mode, approved
 
 ```bash
-./read-only.sh       # answer y
+run       # answer y
 ```
 
 Expected:
@@ -222,13 +237,13 @@ Expected:
   "Creating role …".
 - Both custom role assignments `[ok]`, each with "blob reads limited to
   'lucidity-inventory'".
-- Storage accounts from scenario A: `already_allowed`, no network prompt.
+- Storage accounts from scenario A: `already_allowed`, no storage prompt.
 - Status: `completed_with_warnings`.
 
 ### D. Rerun, nothing to change
 
 ```bash
-./read-only.sh       # answer y
+run       # answer y
 ```
 
 Expected: both roles `unchanged`, all assignments `[ok]` on the first
@@ -237,63 +252,81 @@ attempt (no "retrying" lines), storage accounts `already_allowed`.
 ### E. Visibility after optimization
 
 ```bash
-setv MODE '"visibility"'
-./read-only.sh
+run --mode visibility --features autoscaler
 ```
 
-Expected: "Optimization features are ignored in visibility mode", then a
-yellow **NOTE: Lucidity already has optimization access on …**, and
+Expected: "--features applies to optimization mode only, so it's ignored.",
+then a yellow **NOTE: Lucidity already has optimization access on …**, and
 `[ok] Existing optimization access on …` in the summary. The optimize role
 is still assigned (check in [Verify](#verify)).
 
 ### F. Updates only add: Run Command off
 
 ```bash
-setv GUEST_INSIGHTS false
-./read-only.sh
+run --mode visibility --no-guest-insights
 az role definition list --name lucidity-guest-insights-role-$SUB --scope /subscriptions/$SUB \
   --query "[0].{description: description, runCommand: contains(permissions[0].actions, 'Microsoft.Compute/virtualMachines/runCommand/action')}"
-setv GUEST_INSIGHTS true
 ```
 
 Expected: the guest role is `unchanged; kept 2 permission(s) this run
 didn't ask for (the script never removes permissions)`, and `runCommand` is
 still `true`.
 
-### G. No terminal
+### G. Prompts without a terminal on stdin
+
+**G1. stdin redirected, terminal still there.** The prompt is read from the
+terminal instead:
 
 ```bash
-setv MODE '"optimization"'
-./read-only.sh < /dev/null
+run < /dev/null       # answer n
 ```
 
-Expected: "No terminal to ask for approval", nothing changed, status
-`failed`, and no colours (output isn't a terminal).
+Expected: the `Grant optimization access? [y/N]` prompt still appears and
+takes your answer.
+
+**G2. No terminal at all.** `setsid` detaches the run from the terminal;
+`| cat` makes the output a pipe:
 
 ```bash
-setv AUTO_APPROVE_OPTIMIZATION true
-setv AUTO_APPROVE_STORAGE_CHANGES true
-./read-only.sh < /dev/null
-setv AUTO_APPROVE_OPTIMIZATION false
-setv AUTO_APPROVE_STORAGE_CHANGES false
+setsid -w bash read-only.sh --scope-ids "$SUB" < /dev/null 2>&1 | cat
 ```
 
-Expected: "Auto-approved" for optimization, run completes
-(`completed_with_warnings`).
-
-### H. Invalid settings and no colours
+Expected: "No terminal to ask for approval.", then "Rerun in a terminal,
+or add --auto-approve …", nothing changed, status `failed`, and no colours.
 
 ```bash
-setv BLOBS yes;  ./read-only.sh; setv BLOBS true
-setv MODE '"full"'; ./read-only.sh; setv MODE '"optimization"'
-setv SCOPE_TYPE '"tenant"'; ./read-only.sh; setv SCOPE_TYPE '"subscription"'
-NO_COLOR=1 ./read-only.sh < /dev/null | head -5
+setsid -w bash read-only.sh --scope-ids "$SUB" --auto-approve < /dev/null 2>&1 | cat
 ```
 
-Expected: "ERROR: BLOBS must be true or false", "ERROR: MODE must be
-optimization or visibility" and "ERROR: SCOPE_TYPE must be subscription or
-management_group", each before anything is changed. The last run prints no
-colours.
+Expected: "Auto-approved (--auto-approve)." for optimization, run completes
+(`completed_with_warnings`), and the report has `"autoApprove": true`.
+
+### H. Invalid options
+
+```bash
+run --features autoscaler,foo
+run --mode full
+run --scope-type tenant
+run --mode=visibility --bogus
+bash read-only.sh --scope-ids
+bash read-only.sh --scope-type management_group
+```
+
+Expected, each before anything is changed and followed by the usage text
+(exit code 2, `echo $?`):
+- "unknown feature in --features: 'foo' …"
+- "--mode must be optimization or visibility. Got: 'full'"
+- "--scope-type must be subscription or management_group. Got: 'tenant'"
+- "unknown option: --bogus"
+- "--scope-ids needs a value."
+- "--scope-type management_group needs --scope-ids …"
+
+Then check that the usage lists only the access and permission scope
+options, and `--help` adds "Other options":
+
+```bash
+bash read-only.sh --help
+```
 
 ### I. Management group scope
 
@@ -303,9 +336,7 @@ Needs [Setup step 6](#6-test-management-group-optional).
 has subscription-level roles from the scenarios above.
 
 ```bash
-setv SCOPE_TYPE '"management_group"'
-setv SCOPE_IDS "\"$MG\""
-./read-only.sh       # answer y
+bash read-only.sh --scope-type management_group --scope-ids "$MG"    # answer y
 ```
 
 Expected:
@@ -339,7 +370,7 @@ believe the subscription still has its own roles.
 ```bash
 az role definition list --custom-role-only true --scope "/subscriptions/$SUB" \
   --query "[?starts_with(roleName,'lucidity-guest-insights-role-$SUB') || starts_with(roleName,'lucidity-optimize-role-$SUB')].roleName" -o tsv
-./read-only.sh       # answer y
+bash read-only.sh --scope-type management_group --scope-ids "$MG"    # answer y
 ```
 
 Expected:
@@ -359,9 +390,7 @@ or warned subscription, it's listed as `skip, subscription is …` and the
 run continues. To check a missing management group:
 
 ```bash
-setv SCOPE_IDS "\"no-such-mg $MG\""
-./read-only.sh       # answer y
-setv SCOPE_IDS "\"$MG\""
+bash read-only.sh --scope-type management_group --scope-ids "no-such-mg,$MG"   # answer y
 ```
 
 Expected: "management group 'no-such-mg' not found …", the real management
@@ -375,28 +404,37 @@ role's ID, which it had looked up by name, and failed with
 `RoleDefinitionDoesNotExist`. The script now takes the ID from the creation
 command's own output.
 
+**I4. Excluding a subscription under the group.** If the test subscription
+is the only one in the group, nothing is left to onboard:
+
+```bash
+bash read-only.sh --scope-type management_group --scope-ids "$MG" --exclude-ids "$SUB"
+```
+
+Expected: the test subscription listed as `skip, excluded by
+--exclude-ids`, then "ERROR: no subscriptions to onboard." and status
+`failed`, with nothing changed. With other subscriptions in the group, they
+are onboarded and the test subscription isn't (answer `n` to stop instead).
+
 ### J. Blob setup by the script
 
 Back at subscription scope. What you see first depends on scenario I:
 
 - **Skipped I (or ran only I1):** the subscription's guest role from the
-  earlier `BLOB_SETUP=lucidity` runs still has the container and blob
+  earlier `--blob-setup lucidity` runs still has the container and blob
   service write permissions, so the run highlights them.
 - **Ran I2:** the subscription's own roles were deleted, so this run
   creates a new guest role without those two permissions (no NOTE). The
   management group's guest role, still assigned from I2, keeps its own.
 
 ```bash
-setv SCOPE_TYPE '"subscription"'
-setv SCOPE_IDS "\"$SUB\""
-setv MODE '"visibility"'
-setv BLOB_SETUP '"script"'
-./read-only.sh       # answer y at the storage prompt
+run --mode visibility --blob-setup script      # answer y at the storage prompt
 ```
 
 Expected:
 - Skipped I: a yellow **NOTE: lucidity-guest-insights-role-… still has
-  container and blob service write permissions from an earlier run**, and
+  container and blob service write permissions from an earlier run.
+  --blob-setup script does not remove them**, and
   `[ok] Blob setup permissions in …` in the summary. The permissions are
   kept. Ran I2: "Creating role lucidity-guest-insights-role-…" and no NOTE.
 - `>> Checking blob setup on …` for each storage account, then each account
@@ -429,13 +467,11 @@ az role definition list --name lucidity-guest-insights-role-$SUB --scope /subscr
   --query "[0].{description: description, actions: permissions[0].actions}"
 ```
 
-Afterwards: `setv BLOB_SETUP '"lucidity"'`.
-
 ### K. Finding and creating the service principal
 
 The script normally finds Lucidity's service principal from Lucidity's
 application ID. To test that without involving Lucidity's real one, point
-`LUCIDITY_APP_ID` at the test app. Run this scenario last: K3 deletes and
+`LUCIDITY_APP_ID` at the test app. Run this after A–J: K3 deletes and
 recreates the test service principal.
 
 **K1. Found from the application ID.**
@@ -443,7 +479,7 @@ recreates the test service principal.
 ```bash
 setv LUCIDITY_APP_ID "\"$APP_ID\""
 setv SP_OBJECT_ID '""'
-./read-only.sh       # answer y
+run       # answer y
 ```
 
 Expected: `>> Resolving Lucidity's service principal...`, then "Service
@@ -455,7 +491,7 @@ ID".
 
 ```bash
 setv SP_OBJECT_ID '"00000000-0000-0000-0000-000000000000"'
-./read-only.sh       # answer y
+run       # answer y
 setv SP_OBJECT_ID '""'
 ```
 
@@ -470,7 +506,7 @@ again:
 OLD_SP_OBJECT_ID=$SP_OBJECT_ID
 az ad sp delete --id "$APP_ID"
 sleep 30
-./read-only.sh       # answer y
+run       # answer y
 SP_OBJECT_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv); echo "$SP_OBJECT_ID"
 ```
 
@@ -485,6 +521,69 @@ principal; [cleanup](#cleanup) removes them too.
 Afterwards, put the defaults back:
 `setv LUCIDITY_APP_ID '"4f2c2c1f-372a-4904-b13d-11e2467679f2"'` and
 `setv SP_OBJECT_ID "\"$SP_OBJECT_ID\""`.
+
+### L. All subscriptions and exclusions
+
+Without `--scope-ids` the script targets every subscription you can access
+in the tenant. To test that without touching other subscriptions, exclude
+all of them. A made-up ID is excluded too, to check the typo warning.
+
+```bash
+OTHERS=$(az account list --query "[?tenantId=='$(az account show --query tenantId -o tsv)' && id!='$SUB'].id" -o tsv | paste -sd,)
+echo "excluding: ${OTHERS:-none}"
+bash read-only.sh --mode visibility --exclude-ids "${OTHERS:+$OTHERS,}no-such-sub"
+```
+
+Expected:
+- `>> Targets: every subscription you can access in tenant …`, with the
+  test subscription as `onboard` and every other one as `skip, excluded by
+  --exclude-ids` (or `skip, subscription is …` if it isn't enabled).
+- A yellow warning: "--exclude-ids: 'no-such-sub' matched no target
+  subscription …".
+- "No --scope-ids given, so this onboards every subscription listed
+  above." and `Onboard these 1 subscription(s)? [y/N]`. Check the list
+  shows only the test subscription as `onboard`, then answer `y`.
+- The run continues as in A's rerun. In the report: `"allSubscriptions":
+  true`, the `excludeIds`, the other subscriptions with status `excluded`,
+  and the options under `arguments`.
+
+In optimization mode the same confirmation is folded into the optimization
+question:
+
+```bash
+bash read-only.sh --exclude-ids "${OTHERS:+$OTHERS,}no-such-sub"      # answer n
+```
+
+Expected: `Grant optimization access on these 1 subscription(s)? [y/N]`,
+and after `n`, nothing changed.
+
+A management group ID given as a subscription:
+
+```bash
+run --scope-ids "$SUB,${MG:-some-mg}" --mode visibility
+```
+
+Expected: the second ID as `skip, not found …`, and a warning "some
+subscriptions weren't found. If those are management group IDs, rerun with
+--scope-type management_group." The test subscription is still onboarded.
+
+### M. The one-line command
+
+Run the command from the README against the branch under test. It uses the
+script as shipped, so it would target **Lucidity's real** service principal
+and every subscription: **answer `n`**, which stops it before any change.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/$BRANCH/onboarding-script/read-only.sh) --mode visibility
+# answer n
+curl -fsSL https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/$BRANCH/onboarding-script/read-only.sh | bash -s -- --mode visibility
+# answer n
+```
+
+Expected, for both: the version line, the target list, the prompt
+`Onboard these N subscription(s)? [y/N]` waiting for your answer (in the
+piped form too), and after `n` "not approved. Nothing was changed." No
+"Resolving Lucidity's service principal" line: the run stops before it.
 
 ## Verify
 
@@ -508,7 +607,7 @@ Reports (one per run):
 
 ```bash
 for f in lucidity-onboarding-report-*.json; do
-  jq -c '{file: input_filename, scopeType, mode, blobSetup, status, reservationsReader,
+  jq -c '{file: input_filename, scriptVersion, arguments, mode, blobSetup, status, reservationsReader,
     subscriptions: [.subscriptions[] | "\(.subscriptionId) \(.status) \(.result // "") \(.rolesAt // "")"]}' "$f"
 done
 ```
@@ -572,10 +671,15 @@ az account management-group delete --name $MG
   if it's anything other than the test service principal.
 - Delete only the roles above. The test subscription may hold other
   `lucidity-*` roles from earlier onboarding versions.
+- If scenario M was answered `y` by mistake, Lucidity's real service
+  principal was created and given roles: remove its assignments the same
+  way, filtering by its object ID
+  (`az ad sp list --filter "appId eq '4f2c2c1f-372a-4904-b13d-11e2467679f2'" --query [0].id -o tsv`).
 
 ## Test log
 
-Record each real-Azure test run here.
+Record each real-Azure test run here. Runs before 2026-10-28 edited the
+settings in the file; the scenarios are otherwise the same.
 
 | Date | Script commit | Tester | Scenarios | Result |
 |---|---|---|---|---|
