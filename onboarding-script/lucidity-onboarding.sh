@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Lucidity's Azure onboarding script. Run it with options instead of editing
-# this file; ./read-only.sh --help lists them. The settings below are the
-# defaults, and options override them.
+# this file; bash lucidity-onboarding.sh --help lists them. The settings below
+# are the defaults, and options override them.
 SCRIPT_VERSION="2026-10-28"
 
 # ---------- Defaults ----------
@@ -116,7 +116,7 @@ warn() {
 # The short usage lists the options customers need; --help adds the rest.
 usage() {
   cat <<'EOF'
-Usage: read-only.sh [options]
+Usage: lucidity-onboarding.sh [options]
 
 Access scope (where Lucidity gets access):
   --scope-type TYPE   subscription (default) or management_group
@@ -133,7 +133,7 @@ Permission scope (what Lucidity can do):
                       disk_tiering, comma-separated. Default: autoscaler,blobs
 
 Example:
-  ./read-only.sh --exclude-ids "<subscription-id>" --mode visibility
+  bash lucidity-onboarding.sh --exclude-ids "<subscription-id>" --mode visibility
 EOF
 }
 

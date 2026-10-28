@@ -1,8 +1,8 @@
-# Maintaining read-only.sh (for Lucidity)
+# Maintaining lucidity-onboarding.sh (for Lucidity)
 
 Notes for Lucidity's team on testing and maintaining
-[`read-only.sh`](../read-only.sh). Customer-facing documentation is in the
-[README](../README.md).
+[`lucidity-onboarding.sh`](../lucidity-onboarding.sh). Customer-facing
+documentation is in the [README](../README.md).
 
 ## Keeping the docs in sync
 

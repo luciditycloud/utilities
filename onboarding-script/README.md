@@ -1,6 +1,6 @@
 # Lucidity onboarding script for Azure
 
-`read-only.sh` onboards your Azure subscriptions to Lucidity. It:
+`lucidity-onboarding.sh` onboards your Azure subscriptions to Lucidity. It:
 
 - gives Lucidity's service principal the roles it needs on the
   subscriptions you choose,
@@ -40,8 +40,8 @@ Download the script, review it, and run it with the [options](#options) you
 need:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/main/onboarding-script/read-only.sh
-bash read-only.sh --mode visibility
+curl -fsSLO https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/main/onboarding-script/lucidity-onboarding.sh
+bash lucidity-onboarding.sh --mode visibility
 ```
 
 With no options, the script onboards **every enabled subscription you can

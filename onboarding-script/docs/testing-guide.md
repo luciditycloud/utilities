@@ -1,9 +1,9 @@
-# Testing read-only.sh
+# Testing lucidity-onboarding.sh
 
-How to test [`read-only.sh`](../read-only.sh) end to end in a test Azure
-tenant. Run through it after every change to the script, and update this
-guide alongside the [README](../README.md) and [maintaining.md](maintaining.md)
-whenever the script changes.
+How to test [`lucidity-onboarding.sh`](../lucidity-onboarding.sh) end to end
+in a test Azure tenant. Run through it after every change to the script, and
+update this guide alongside the [README](../README.md) and
+[maintaining.md](maintaining.md) whenever the script changes.
 
 The tests use a **throwaway service principal** in place of Lucidity's, so
 you hold its credentials and can check what it can actually do.
@@ -19,7 +19,7 @@ you hold its credentials and can check what it can actually do.
   unless an admin turned it off).
 - **Azure Cloud Shell in Bash mode** (not PowerShell). It has `az`, `jq`,
   `curl` and `setsid`.
-- The version of `read-only.sh` you want to test.
+- The version of `lucidity-onboarding.sh` you want to test.
 
 Keep the same Cloud Shell session for the whole test: the steps share shell
 variables. If the session restarts, redo [Setup step 1](#1-variables),
@@ -86,8 +86,8 @@ from the branch under test:
 
 ```bash
 BRANCH=<branch>
-curl -fsSLo read-only.sh https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/$BRANCH/onboarding-script/read-only.sh
-bash read-only.sh --help | head -1     # shows the script version
+curl -fsSLo lucidity-onboarding.sh https://raw.githubusercontent.com/luciditycloud/utilities/refs/heads/$BRANCH/onboarding-script/lucidity-onboarding.sh
+bash lucidity-onboarding.sh --help | head -1     # shows the script version
 ```
 
 ### 5. Point the script at the test service principal
@@ -96,7 +96,7 @@ Two settings have no option, so they're edited in the file. `setv` changes
 one setting in place and prints the result:
 
 ```bash
-setv() { sed -i "s|^$1=.*|$1=$2|" read-only.sh; grep "^$1=" read-only.sh; }
+setv() { sed -i "s|^$1=.*|$1=$2|" lucidity-onboarding.sh; grep "^$1=" lucidity-onboarding.sh; }
 
 setv SP_OBJECT_ID "\"$SP_OBJECT_ID\""
 setv STORAGE_ACCOUNTS "\"luctopen$SFX luctuk$SFX lucteast$SFX luctoff$SFX\""
@@ -117,7 +117,7 @@ Most scenarios run the script on the test subscription. `run` does that,
 passing any further options:
 
 ```bash
-run() { bash read-only.sh --scope-ids "$SUB" "$@"; }
+run() { bash lucidity-onboarding.sh --scope-ids "$SUB" "$@"; }
 ```
 
 ### 6. Test management group (optional)
@@ -289,14 +289,14 @@ takes your answer.
 `| cat` makes the output a pipe:
 
 ```bash
-setsid -w bash read-only.sh --scope-ids "$SUB" < /dev/null 2>&1 | cat
+setsid -w bash lucidity-onboarding.sh --scope-ids "$SUB" < /dev/null 2>&1 | cat
 ```
 
 Expected: "No terminal to ask for approval.", then "Rerun in a terminal,
 or add --auto-approve …", nothing changed, status `failed`, and no colours.
 
 ```bash
-setsid -w bash read-only.sh --scope-ids "$SUB" --auto-approve < /dev/null 2>&1 | cat
+setsid -w bash lucidity-onboarding.sh --scope-ids "$SUB" --auto-approve < /dev/null 2>&1 | cat
 ```
 
 Expected: "Auto-approved (--auto-approve)." for optimization, run completes
@@ -309,8 +309,8 @@ run --features autoscaler,foo
 run --mode full
 run --scope-type tenant
 run --mode=visibility --bogus
-bash read-only.sh --scope-ids
-bash read-only.sh --scope-type management_group
+bash lucidity-onboarding.sh --scope-ids
+bash lucidity-onboarding.sh --scope-type management_group
 ```
 
 Expected, each before anything is changed and followed by the usage text
@@ -326,7 +326,7 @@ Then check that the usage lists only the access and permission scope
 options, and `--help` adds "Other options":
 
 ```bash
-bash read-only.sh --help
+bash lucidity-onboarding.sh --help
 ```
 
 ### I. Management group scope
@@ -337,7 +337,7 @@ Needs [Setup step 6](#6-test-management-group-optional).
 has subscription-level roles from the scenarios above.
 
 ```bash
-bash read-only.sh --scope-type management_group --scope-ids "$MG"    # answer y
+bash lucidity-onboarding.sh --scope-type management_group --scope-ids "$MG"    # answer y
 ```
 
 Expected:
@@ -371,7 +371,7 @@ believe the subscription still has its own roles.
 ```bash
 az role definition list --custom-role-only true --scope "/subscriptions/$SUB" \
   --query "[?starts_with(roleName,'lucidity-guest-insights-role-$SUB') || starts_with(roleName,'lucidity-optimize-role-$SUB')].roleName" -o tsv
-bash read-only.sh --scope-type management_group --scope-ids "$MG"    # answer y
+bash lucidity-onboarding.sh --scope-type management_group --scope-ids "$MG"    # answer y
 ```
 
 Expected:
@@ -391,7 +391,7 @@ or warned subscription, it's listed as `skip, subscription is …` and the
 run continues. To check a missing management group:
 
 ```bash
-bash read-only.sh --scope-type management_group --scope-ids "no-such-mg,$MG"   # answer y
+bash lucidity-onboarding.sh --scope-type management_group --scope-ids "no-such-mg,$MG"   # answer y
 ```
 
 Expected: "management group 'no-such-mg' not found …", the real management
@@ -409,7 +409,7 @@ command's own output.
 is the only one in the group, nothing is left to onboard:
 
 ```bash
-bash read-only.sh --scope-type management_group --scope-ids "$MG" --exclude-ids "$SUB"
+bash lucidity-onboarding.sh --scope-type management_group --scope-ids "$MG" --exclude-ids "$SUB"
 ```
 
 Expected: the test subscription listed as `skip, excluded by
@@ -532,7 +532,7 @@ all of them. A made-up ID is excluded too, to check the typo warning.
 ```bash
 OTHERS=$(az account list --query "[?tenantId=='$(az account show --query tenantId -o tsv)' && id!='$SUB'].id" -o tsv | paste -sd,)
 echo "excluding: ${OTHERS:-none}"
-bash read-only.sh --mode visibility --exclude-ids "${OTHERS:+$OTHERS,}no-such-sub"
+bash lucidity-onboarding.sh --mode visibility --exclude-ids "${OTHERS:+$OTHERS,}no-such-sub"
 ```
 
 Expected:
@@ -552,7 +552,7 @@ In optimization mode the same confirmation is folded into the optimization
 question:
 
 ```bash
-bash read-only.sh --exclude-ids "${OTHERS:+$OTHERS,}no-such-sub"      # answer n
+bash lucidity-onboarding.sh --exclude-ids "${OTHERS:+$OTHERS,}no-such-sub"      # answer n
 ```
 
 Expected: `Grant optimization access on these 1 subscription(s)? [y/N]`,
