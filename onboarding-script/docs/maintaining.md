@@ -90,6 +90,42 @@ resolve or create the service principal, assign any role, or do blob setup.
 It can't be combined with `--mode`, `--feature-modules`, `--blob-setup` or
 `--no-guest-insights`. The report's `mode` is `network-check-only`.
 
+## How Lucidity's traffic reaches a storage account
+
+Lucidity's backend runs in `aks-subnet` (East US), which has a Regional
+`Microsoft.Storage` service endpoint, and goes out to the internet through
+a load balancer with a public IP (`LUCIDITY_EGRESS_IPS`).
+
+| Public network access | Result | What the script does |
+|---|---|---|
+| Enabled from all networks | Reachable | Nothing (`open`) |
+| Enabled from selected networks | Reachable once Lucidity's rules are added | Adds the rules (`needs_rule`), by region as below |
+| Disabled | Unreachable: Azure ignores firewall rules and allows only private endpoints, and Lucidity has none. Service endpoint traffic is blocked too, as it goes to the public endpoint | Reports it (`public_access_disabled`); out of scope |
+| Secured by a network security perimeter | Depends on the perimeter's access rules | Reports it (`network_perimeter`) |
+
+For selected networks, the region decides which rule works:
+
+- **East US, West US, West US 3** (`LUCIDITY_SUBNET_REGIONS`): traffic from
+  the subnet goes over the service endpoint with a private source address,
+  so only the **subnet rule** lets it in. Azure IP rules don't apply to this
+  traffic. The script still adds the IP rule: it has no effect while the
+  endpoint is in place, costs nothing, and covers traffic that doesn't take
+  the endpoint.
+- **Every other region:** traffic leaves through the public outbound IP, so
+  only the **IP rule** works. Azure rejects the subnet rule (retested
+  2026-10-29 on a UK South account: `NetworkAclsValidationFailure`,
+  "Microsoft.Storage resources in uksouth cannot be ACL-ed to virtual
+  network … in eastus. Only resources in eastus, westus, westus3 can be
+  ACL-ed to virtual networks in eastus").
+
+The rejection is tested. Which rule actually carries the traffic in each
+region is from Azure's documented behaviour, not tested: that needs blob
+reads from a pod in `aks-subnet` against accounts with one rule each (East
+US and West US 3 with the subnet rule only and with the IP rule only, UK
+South with the IP rule only, and East US with public access disabled and a
+subnet rule). The script adds both rules where it can, so its result doesn't
+depend on which one it is.
+
 ## Network details
 
 The *Lucidity network details* block at the top of the script holds values
@@ -155,9 +191,10 @@ As of 2026-10-29.
   with a test app in the same tenant; Lucidity's multi-tenant app in a
   customer tenant is untested.
 - Running without a terminal, and `--auto-approve`.
-- Re-test asked for after the 2026-10-28 demo: whether the subnet rule can be
-  added on accounts outside East US, West US and West US 3. On 2026-10-24
-  Azure rejected it on a UK South account (error above).
+- Which firewall rule carries Lucidity's traffic in each region, and that
+  public access disabled blocks it even with a subnet rule: needs access to
+  `aks-subnet` (see
+  [How Lucidity's traffic reaches a storage account](#how-luciditys-traffic-reaches-a-storage-account)).
 
 ## Previous version
 

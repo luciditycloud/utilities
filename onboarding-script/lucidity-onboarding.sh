@@ -1305,15 +1305,17 @@ fi
 # subscriptions.
 #
 # Firewall rules (STORAGE_NETWORK_CHECK). Lucidity reads blob inventory over
-# the storage data plane, which a storage firewall can block. Lucidity's
-# network tests (outbound via load balancer, Regional service endpoint):
-#   - Accounts in Lucidity's region (and possibly its paired region) see
-#     Lucidity's subnet, so the subnet rule applies.
+# the storage data plane, which a storage firewall can block (outbound via
+# load balancer, Regional service endpoint):
+#   - Accounts in LUCIDITY_SUBNET_REGIONS see Lucidity's subnet through the
+#     service endpoint, so the subnet rule applies. They get the IP rule too,
+#     which costs nothing.
 #   - Accounts in other regions see Lucidity's public IP, so the IP rule
-#     applies.
-# Adding both to every firewalled account covers either case. Only Lucidity's
-# own rules are added or removed; defaultAction and publicNetworkAccess are
-# never changed.
+#     applies; Azure rejects the subnet rule there.
+#   - With public network access disabled, only a private endpoint can reach
+#     an account, so those are only reported.
+# Only Lucidity's own rules are added or removed; defaultAction and
+# publicNetworkAccess are never changed.
 #
 # Blob setup (BLOB_SETUP=script): the lucidity-inventory container and last
 # access time tracking. These are management operations, so a storage
@@ -1330,7 +1332,7 @@ BLOB_SETUP_KINDS='["StorageV2","BlobStorage","BlockBlobStorage"]'
 storage_note() {
   case "$1" in
     public_access_disabled)
-      echo "Public network access is disabled. Allow selected networks and rerun, or ask Lucidity about a private endpoint." ;;
+      echo "Public network access is disabled, so Lucidity can't reach them. To include them, allow selected networks and rerun." ;;
     network_perimeter)
       echo "Secured by a network security perimeter. Add Lucidity to the perimeter's access rules." ;;
     not_found)

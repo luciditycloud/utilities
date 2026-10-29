@@ -160,14 +160,21 @@ Output is coloured in a terminal. Set `NO_COLOR=1` to turn colours off.
 
 ## Storage accounts
 
-Lucidity reads the blob inventory reports over the network. If a storage
-account's firewall allows only selected networks, Lucidity needs rules
-allowing its traffic:
+Lucidity reads the blob inventory reports over the network, so what an
+account needs depends on its public network access setting:
 
-- an **IP rule** for Lucidity's outbound IP, on every such account, and
-- a **subnet rule** for Lucidity's subnet, on accounts in the regions
-  Lucidity's subnet can reach (currently East US, West US and West US 3).
-  Azure rejects the subnet rule elsewhere.
+| Public network access | What Lucidity needs |
+|---|---|
+| Enabled from all networks | Nothing |
+| Enabled from selected networks | Lucidity's firewall rules, by region (below) |
+| Disabled | Lucidity can't reach the account: only a private endpoint could, and Lucidity doesn't offer one. Out of scope unless you allow selected networks |
+
+For selected networks, the rules depend on where the account is:
+
+| Account region | Rules added | Why |
+|---|---|---|
+| East US, West US, West US 3 | Subnet rule and IP rule | Lucidity's traffic arrives through its subnet's service endpoint, so the subnet rule is the one that lets it in. The IP rule has no effect there |
+| Any other region | IP rule only | Lucidity's traffic arrives from its outbound IP. Azure rejects the subnet rule in these regions |
 
 The script checks every storage account in the onboarded subscriptions,
 shows how many need each rule, and asks once before adding them. The report
@@ -181,7 +188,7 @@ adding storage accounts)? Run with `--network-check-only`.
 | `open` | Firewall allows all networks | Nothing needed |
 | `already_allowed` | Lucidity's rules are already in place | Nothing needed |
 | `needs_rule` | Firewall allows selected networks and a Lucidity rule is missing | The missing rules are added, after your approval |
-| `public_access_disabled` | Public network access is disabled | Manual: allow selected networks and rerun, or ask Lucidity about a private endpoint |
+| `public_access_disabled` | Public network access is disabled | Out of scope: Lucidity can't reach it. To include it, allow selected networks and rerun |
 | `network_perimeter` | Secured by a network security perimeter | Manual: add Lucidity to the perimeter's access rules |
 | `not_applicable` | File-share-only account | Nothing needed |
 
