@@ -1133,8 +1133,14 @@ elif [[ ${#FEATURES[@]} -eq 0 ]]; then
   progress "Mode: optimization, but no feature modules are selected"
 fi
 
-if [[ "$NETWORK_CHECK_ONLY" == true ]]; then
+if [[ "$NETWORK_CHECK_ONLY" == true && "$ALL_SUBSCRIPTIONS" != true ]]; then
   :   # the storage prompt is the only approval needed
+elif [[ "$NETWORK_CHECK_ONLY" == true ]]; then
+  echo "" >&2
+  echo "${BOLD}No --scope-ids given, so this checks storage accounts in every subscription listed above.${RESET}" >&2
+  approve "Subscription list approval" "Check storage accounts in these $ELIGIBLE subscription(s)?" \
+    "approved $ELIGIBLE subscription(s)" \
+    "Approve at the prompt, or name the subscriptions with --scope-ids or leave some out with --exclude-ids."
 elif [[ "$MODE" == optimization && ${#FEATURES[@]} -gt 0 ]]; then
   echo "" >&2
   echo "${BOLD}==============================================================" >&2

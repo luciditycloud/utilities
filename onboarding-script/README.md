@@ -92,7 +92,7 @@ See [What it grants](#what-it-grants) for the details.
 | Option | What it does |
 |---|---|
 | `-y`, `--auto-approve` | Answer yes to every prompt, for runs without a terminal |
-| `--network-check-only` | Only check storage account firewalls and add Lucidity's rules, for when Lucidity's roles are already in place. Grants no roles. Can't be combined with the permission scope options |
+| `--network-check-only` | Only check storage account firewalls and add Lucidity's rules, for when Lucidity's roles are already in place. Grants no roles. Can't be combined with `--mode`, `--feature-modules`, `--blob-setup` or `--no-guest-insights` |
 | `--blob-setup script` | The script sets up blob inventory on your storage accounts with your credentials, instead of giving Lucidity's role those permissions. Storage accounts created later need a rerun |
 | `--no-guest-insights` | Don't grant VM Run Command |
 | `-h`, `--help` | Show all options |

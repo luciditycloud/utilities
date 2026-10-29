@@ -646,6 +646,16 @@ Expected:
 - In the report, `"mode": "network-check-only"` and an empty
   `servicePrincipalObjectId`.
 
+Without `--scope-ids` it asks to confirm the subscription list first, as
+the other modes do. Answer `n`:
+
+```bash
+bash lucidity-onboarding.sh -t subscription --network-check-only      # answer n
+```
+
+Expected: `Check storage accounts in these N subscription(s)? [y/N]`, and
+after `n`, "not approved. Nothing was changed." with no storage prompt.
+
 ## Verify
 
 Run as yourself after the scenarios.
