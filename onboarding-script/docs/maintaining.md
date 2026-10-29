@@ -112,8 +112,10 @@ For selected networks, the region decides which rule works:
   endpoint is in place, costs nothing, and covers traffic that doesn't take
   the endpoint.
 - **Every other region:** traffic leaves through the public outbound IP, so
-  only the **IP rule** works. Azure rejects the subnet rule (retested
-  2026-10-29 on a UK South account: `NetworkAclsValidationFailure`,
+  only the **IP rule** works. Azure rejects the subnet rule, whatever the
+  public access setting (retested 2026-10-29 on UK South accounts with
+  public access disabled and with selected networks:
+  `NetworkAclsValidationFailure`,
   "Microsoft.Storage resources in uksouth cannot be ACL-ed to virtual
   network … in eastus. Only resources in eastus, westus, westus3 can be
   ACL-ed to virtual networks in eastus").
@@ -150,7 +152,9 @@ that change on Lucidity's side:
   and IP rules stop working. Set `LUCIDITY_SUBNET_REGIONS="*"`, set
   `LUCIDITY_EGRESS_IPS=""` and move its IPs to
   `LUCIDITY_RETIRED_EGRESS_IPS`. A customer rerun then adds the subnet rule
-  everywhere and removes the IP rules. No code change is needed.
+  everywhere and removes the IP rules. No code change is needed. Adding the
+  subnet rule outside the covered regions ahead of time isn't possible:
+  Azure rejects it until the Global endpoint is in place.
 
 ## Open items
 
