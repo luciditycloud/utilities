@@ -176,8 +176,11 @@ As of 2026-10-29.
   give the management group IDs): it picks the management groups with no
   accessible parent, using each entity's `permissions`
   (`noaccess` means not accessible) and `parentNameChain` from
-  `az account management-group entities list`. Check those fields in a real
-  tenant, both with and without access to the tenant root group.
+  `az account management-group entities list`. Tested 2026-10-29 only in a
+  tenant where the account can access no group (the root group showed
+  `permissions` `noaccess`; the script stopped with an error). Check a
+  tenant where the account can access the root group, and one where it can
+  access only some groups.
 - The all-subscriptions default with its confirmation (only the
   "nothing left after exclusions" case was run in real Azure).
 - Management group scope with several subscriptions or nested groups, and
