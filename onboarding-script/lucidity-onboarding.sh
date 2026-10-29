@@ -1,36 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ---------- Inputs ----------
-# Where to onboard:
+# Lucidity's Azure onboarding script. Run it with options instead of editing
+# this file; bash lucidity-onboarding.sh --help lists them. The settings below
+# are the defaults, and options override them.
+SCRIPT_VERSION="2026-10-29"
+
+# ---------- Defaults ----------
+# Access scope: where Lucidity gets access.
+#   management-group  SCOPE_IDS are management group IDs. Roles are created
+#                     at each management group and assigned on every enabled
+#                     subscription under it, nested groups included. Empty
+#                     SCOPE_IDS means the top management groups you can access
+#                     (the tenant root group if you can), after you confirm
+#                     the list.
 #   subscription      SCOPE_IDS are subscription IDs. Each gets its own roles.
-#   management_group  SCOPE_IDS are management group IDs. Roles are created at
-#                     each management group and assigned on every enabled
-#                     subscription under it, nested groups included.
-SCOPE_TYPE="subscription"
-SCOPE_IDS="<scope-id>"   # one or more, comma- or space-separated
-# Lucidity's service principal in your tenant. Leave empty: the script finds
-# it from Lucidity's application ID, and creates it in your tenant if it isn't
-# there yet. Set it only if Lucidity gives you an object ID.
-SP_OBJECT_ID=""
+#                     Empty SCOPE_IDS means every enabled subscription you can
+#                     access in this tenant, after you confirm the list.
+# EXCLUDE_IDS leaves out subscriptions, or with management groups also nested
+# management groups (everything under them).
+SCOPE_TYPE="management-group"   # -t, --scope-type
+SCOPE_IDS=""                    # -s, --scope-ids, comma- or space-separated
+EXCLUDE_IDS=""                  # -x, --exclude-ids, comma- or space-separated
 
-# Mode:
+# Permission scope: what Lucidity can do.
 #   optimization  Lucidity gets read access plus write and delete permissions
-#                 for the optimization features below. You approve this at a
-#                 prompt, or AUTO_APPROVE_OPTIMIZATION=true skips it.
+#                 for the feature modules below. You approve this at a
+#                 prompt.
 #   visibility    Read access, guest insights and blob visibility only: what
-#                 Lucidity needs to project your savings. No approval needed.
-MODE="optimization"
-AUTO_APPROVE_OPTIMIZATION=false
+#                 Lucidity needs to project your savings.
+MODE="optimization"         # -m, --mode
 
-# Optimization features (optimization mode only; ignored in visibility).
+# Feature modules (optimization mode only; ignored in visibility).
+# --feature-modules replaces these with the modules it lists.
 AUTOSCALER=true
 IDLE_DISK=false
 DISK_TIERING=false
 BLOBS=true
 
 # Visibility data (both modes).
-GUEST_INSIGHTS=true    # VM Run Command, so Lucidity can collect data inside VMs
+GUEST_INSIGHTS=true    # VM Run Command, so Lucidity can collect data inside VMs (--no-guest-insights)
 BLOB_VISIBILITY=true   # blob inventory, read only in the lucidity-inventory container
 
 # Who sets up blob visibility on each storage account: the lucidity-inventory
@@ -40,16 +49,27 @@ BLOB_VISIBILITY=true   # blob inventory, read only in the lucidity-inventory con
 #   script    This script does it now, with your credentials, and Lucidity's
 #             role doesn't get those two permissions. Storage accounts created
 #             later need a rerun.
-BLOB_SETUP="lucidity"
+BLOB_SETUP="lucidity"  # --blob-setup
 
 # Storage changes: firewall rules (used when BLOBS or BLOB_VISIBILITY is on)
 # and, with BLOB_SETUP=script, the container and last access time tracking.
 # The script lists what each storage account needs and makes the changes only
-# after you approve them at the prompt, or without asking when
-# AUTO_APPROVE_STORAGE_CHANGES=true.
+# after you approve them at the prompt.
 STORAGE_NETWORK_CHECK=true
-AUTO_APPROVE_STORAGE_CHANGES=false
 STORAGE_ACCOUNTS=""   # names, comma- or space-separated; empty = all in the target subscriptions
+
+# Answer yes to every prompt: the subscription list, optimization access and
+# storage changes (--auto-approve).
+AUTO_APPROVE=false
+
+# Only check storage account firewalls and add Lucidity's rules: no roles,
+# no service principal, no blob setup (--network-check-only).
+NETWORK_CHECK_ONLY=false
+
+# Lucidity's service principal in your tenant. Leave empty: the script finds
+# it from Lucidity's application ID, and creates it in your tenant if it isn't
+# there yet. Set it only if Lucidity gives you an object ID.
+SP_OBJECT_ID=""
 
 # ---------- Lucidity details (provided by Lucidity) ----------
 # Lucidity's application ID; its service principal in your tenant gets the
@@ -99,6 +119,132 @@ warn() {
   printf '%s' "$RESET" >&2
 }
 
+# ---------- Options ----------
+# The short usage lists the options customers need; --help adds the rest.
+usage() {
+  cat <<'EOF'
+Usage: lucidity-onboarding.sh [options]
+
+Access scope (where Lucidity gets access):
+  -t, --scope-type TYPE      management-group (default) or subscription
+  -s, --scope-ids IDS        Management group IDs, comma-separated.
+                             With --scope-type subscription: subscription IDs
+                             (optional; without it, every enabled subscription
+                             you can access, after you confirm the list).
+  -x, --exclude-ids IDS      Subscriptions or nested management groups to
+                             leave out, comma-separated.
+
+Permission scope (what Lucidity can do):
+  -m, --mode MODE            optimization (default) or visibility
+  -f, --feature-modules LIST Optimization mode only: autoscaler, blobs,
+                             idle-disk, disk-tiering, comma-separated.
+                             Default: autoscaler,blobs
+
+Example:
+  bash lucidity-onboarding.sh --scope-ids="<mg-id-1>,<mg-id-2>" --mode=visibility
+EOF
+}
+
+usage_full() {
+  echo "Lucidity onboarding script, version $SCRIPT_VERSION"
+  echo ""
+  usage
+  cat <<'EOF'
+
+Other options:
+  -y, --auto-approve         Answer yes to every prompt: the subscription
+                             list, optimization access and storage changes
+  --network-check-only       Only check storage account firewalls and add
+                             Lucidity's rules. Grants no roles.
+  --blob-setup WHO           lucidity (default) or script: who creates the
+                             lucidity-inventory container and turns on last
+                             access time tracking
+  --no-guest-insights        Don't grant VM Run Command
+  -h, --help                 Show this help
+EOF
+}
+
+usage_error() {
+  error "$1"
+  echo "" >&2
+  usage >&2
+  exit 2
+}
+
+# The options as given, for the report.
+ARGS_JSON='[]'
+[[ $# -gt 0 ]] && ARGS_JSON=$(printf '%s\n' "$@" | jq -Rsc 'split("\n")[:-1]')
+MODULES_OPTION=""
+# Options --network-check-only can't be combined with.
+PERMISSION_OPTIONS=()
+
+while [[ $# -gt 0 ]]; do
+  opt="$1"
+  value=""
+  has_value=false
+  if [[ "$opt" == -*=* ]]; then
+    value="${opt#*=}"
+    opt="${opt%%=*}"
+    has_value=true
+  fi
+  shift
+
+  case "$opt" in
+    -t) opt=--scope-type ;;
+    -s) opt=--scope-ids ;;
+    -x) opt=--exclude-ids ;;
+    -m) opt=--mode ;;
+    -f) opt=--feature-modules ;;
+    -y) opt=--auto-approve ;;
+    -h) opt=--help ;;
+  esac
+
+  case "$opt" in
+    --help) usage_full; exit 0 ;;
+    --auto-approve|--no-guest-insights|--network-check-only)
+      [[ "$has_value" == true ]] && usage_error "$opt doesn't take a value."
+      case "$opt" in
+        --auto-approve) AUTO_APPROVE=true ;;
+        --no-guest-insights) GUEST_INSIGHTS=false; PERMISSION_OPTIONS+=("$opt") ;;
+        --network-check-only) NETWORK_CHECK_ONLY=true ;;
+      esac
+      continue ;;
+    --scope-type|--scope-ids|--exclude-ids|--mode|--feature-modules|--blob-setup) ;;
+    *) usage_error "unknown option: $opt" ;;
+  esac
+
+  if [[ "$has_value" != true ]]; then
+    [[ $# -eq 0 || "$1" == -* ]] && usage_error "$opt needs a value."
+    value="$1"
+    shift
+  fi
+  [[ -z "${value//[ ,]/}" ]] && usage_error "$opt needs a value."
+
+  case "$opt" in
+    --scope-type) SCOPE_TYPE="$value" ;;
+    --scope-ids) SCOPE_IDS="$value" ;;
+    --exclude-ids) EXCLUDE_IDS="$value" ;;
+    --mode) MODE="$value"; PERMISSION_OPTIONS+=("$opt") ;;
+    --feature-modules) MODULES_OPTION="$value"; PERMISSION_OPTIONS+=("$opt") ;;
+    --blob-setup) BLOB_SETUP="$value"; PERMISSION_OPTIONS+=("$opt") ;;
+  esac
+done
+
+# --feature-modules lists exactly the modules to grant.
+if [[ -n "$MODULES_OPTION" ]]; then
+  AUTOSCALER=false; IDLE_DISK=false; DISK_TIERING=false; BLOBS=false
+  read -ra module_list <<< "$(tr ',' ' ' <<< "$MODULES_OPTION")"
+  for module in "${module_list[@]}"; do
+    case "$(tr 'A-Z_' 'a-z-' <<< "$module")" in
+      autoscaler) AUTOSCALER=true ;;
+      blobs) BLOBS=true ;;
+      idle-disk) IDLE_DISK=true ;;
+      disk-tiering) DISK_TIERING=true ;;
+      *) usage_error "unknown module in --feature-modules: '$module'. Use autoscaler, blobs, idle-disk or disk-tiering." ;;
+    esac
+  done
+fi
+
 # ---------- Preflight ----------
 for cmd in az jq; do
   command -v "$cmd" >/dev/null 2>&1 || {
@@ -107,35 +253,26 @@ for cmd in az jq; do
   }
 done
 
-if [[ "$SCOPE_IDS" == "<"* || -z "${SCOPE_IDS//[ ,]/}" ]]; then
-  error "set SCOPE_IDS at the top of this script."
-  exit 1
-fi
 [[ "$SP_OBJECT_ID" == "<"* ]] && SP_OBJECT_ID=""
 
+SCOPE_TYPE=$(tr 'A-Z_' 'a-z-' <<< "$SCOPE_TYPE")
 case "$SCOPE_TYPE" in
-  subscription|management_group) ;;
-  *)
-    error "SCOPE_TYPE must be subscription or management_group. Got: '$SCOPE_TYPE'"
-    exit 1 ;;
+  management-group|subscription) ;;
+  *) usage_error "--scope-type must be management-group or subscription. Got: '$SCOPE_TYPE'" ;;
 esac
 
 case "$MODE" in
   optimization|visibility) ;;
-  *)
-    error "MODE must be optimization or visibility. Got: '$MODE'"
-    exit 1 ;;
+  *) usage_error "--mode must be optimization or visibility. Got: '$MODE'" ;;
 esac
 
 case "$BLOB_SETUP" in
   lucidity|script) ;;
-  *)
-    error "BLOB_SETUP must be lucidity or script. Got: '$BLOB_SETUP'"
-    exit 1 ;;
+  *) usage_error "--blob-setup must be lucidity or script. Got: '$BLOB_SETUP'" ;;
 esac
 
-for setting in AUTO_APPROVE_OPTIMIZATION AUTOSCALER IDLE_DISK DISK_TIERING BLOBS \
-    GUEST_INSIGHTS BLOB_VISIBILITY STORAGE_NETWORK_CHECK AUTO_APPROVE_STORAGE_CHANGES; do
+for setting in AUTO_APPROVE AUTOSCALER IDLE_DISK DISK_TIERING BLOBS \
+    GUEST_INSIGHTS BLOB_VISIBILITY STORAGE_NETWORK_CHECK; do
   case "${!setting}" in
     true|false) ;;
     *)
@@ -145,14 +282,24 @@ for setting in AUTO_APPROVE_OPTIMIZATION AUTOSCALER IDLE_DISK DISK_TIERING BLOBS
 done
 
 read -ra SCOPE_ID_LIST <<< "$(tr ',' ' ' <<< "$SCOPE_IDS")"
+read -ra EXCLUDE_ID_LIST <<< "$(tr ',' ' ' <<< "$EXCLUDE_IDS")"
+
+if [[ "$NETWORK_CHECK_ONLY" == true && ${#PERMISSION_OPTIONS[@]} -gt 0 ]]; then
+  usage_error "--network-check-only grants no roles, so it can't be combined with ${PERMISSION_OPTIONS[0]}."
+fi
+if [[ "$NETWORK_CHECK_ONLY" == true && "$STORAGE_NETWORK_CHECK" != true ]]; then
+  error "--network-check-only needs STORAGE_NETWORK_CHECK=true."
+  exit 1
+fi
+
+# Without scope IDs, every subscription the account can access is a target
+# (with management groups, through the top groups it can access), so the
+# list is confirmed before anything changes.
+ALL_SUBSCRIPTIONS=false
+[[ ${#SCOPE_ID_LIST[@]} -eq 0 ]] && ALL_SUBSCRIPTIONS=true
 
 # Visibility mode never grants optimization permissions.
-OPTIMIZATION_FEATURES_IGNORED=false
 if [[ "$MODE" == visibility ]]; then
-  if [[ "$AUTOSCALER" == true || "$IDLE_DISK" == true ||
-        "$DISK_TIERING" == true || "$BLOBS" == true ]]; then
-    OPTIMIZATION_FEATURES_IGNORED=true
-  fi
   AUTOSCALER=false
   IDLE_DISK=false
   DISK_TIERING=false
@@ -165,6 +312,8 @@ FEATURES=()
 [[ "$DISK_TIERING" == true ]] && FEATURES+=("disk tiering")
 [[ "$BLOBS" == true ]] && FEATURES+=("blobs")
 FEATURE_LIST=$(IFS=,; echo "${FEATURES[*]:-}" | sed 's/,/, /g')
+
+progress "Lucidity onboarding script, version $SCRIPT_VERSION"
 
 az account show >/dev/null 2>&1 || {
   error "not logged in to Azure CLI. Run 'az login', then rerun."
@@ -220,11 +369,17 @@ finish() {
   [[ -f "$STORAGE_CHECKED_FILE" ]] && storage_checked=true
   report=$(jq -s \
     --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg scriptVersion "$SCRIPT_VERSION" \
+    --argjson arguments "$ARGS_JSON" \
     --arg tenantId "$TENANT_ID" \
     --arg spObjectId "$SP_OBJECT_ID" \
     --argjson rc "$rc" \
     --arg scopeType "$SCOPE_TYPE" \
     --argjson scopeIds "$(to_json_list "$SCOPE_IDS")" \
+    --argjson excludeIds "$(to_json_list "$EXCLUDE_IDS")" \
+    --argjson allSubscriptions "$ALL_SUBSCRIPTIONS" \
+    --argjson autoApprove "$AUTO_APPROVE" \
+    --argjson networkCheckOnly "$NETWORK_CHECK_ONLY" \
     --arg mode "$MODE" \
     --arg reservationsReader "$RESERVATIONS_READER" \
     --argjson guestInsights "$GUEST_INSIGHTS" \
@@ -245,19 +400,24 @@ finish() {
     --slurpfile storage "$STORAGE_FILE" \
     '{
       generatedAt: $generatedAt,
+      scriptVersion: $scriptVersion,
+      arguments: $arguments,
       tenantId: $tenantId,
       servicePrincipalObjectId: $spObjectId,
       scopeType: $scopeType,
       scopeIds: $scopeIds,
-      mode: $mode,
-      features: {
-        guestInsights: $guestInsights,
+      excludeIds: $excludeIds,
+      allSubscriptions: $allSubscriptions,
+      mode: (if $networkCheckOnly then "network-check-only" else $mode end),
+      autoApprove: $autoApprove,
+      featureModules: {
         autoscaler: $autoscaler,
         idleDisk: $idleDisk,
         diskTiering: $diskTiering,
-        blobs: $blobs,
-        blobVisibility: $blobVisibility
+        blobs: $blobs
       },
+      guestInsights: $guestInsights,
+      blobVisibility: $blobVisibility,
       blobSetup: $blobSetup,
       reservationsReader: $reservationsReader,
       status: (if $rc != 0 then "failed"
@@ -326,8 +486,7 @@ trap finish EXIT
 
 TENANT_ID=$(az account show --query tenantId -o tsv)
 
-# ---------- Lucidity's service principal ----------
-# Find Lucidity's service principal in your tenant, creating it from
+# Finds Lucidity's service principal in your tenant, creating it from
 # Lucidity's application if it's missing. Each failure reports its actual
 # cause.
 resolve_sp() {
@@ -386,9 +545,6 @@ resolve_sp() {
   record_step "Lucidity service principal" "ok" true "created in this tenant"
 }
 
-progress "Resolving Lucidity's service principal..."
-resolve_sp
-echo "   Service principal object ID: $SP_OBJECT_ID" >&2
 
 # ---------- Helpers ----------
 json_array() {
@@ -403,6 +559,55 @@ run_contained() {
   ( set -e; "$@" ) </dev/null
   CONTAINED_RC=$?
   set -e
+}
+
+# True if there's a terminal to ask questions on. When stdin isn't one (for
+# example, the script itself came in on stdin), prompts use /dev/tty.
+has_terminal() {
+  [[ -t 0 ]] || { : < /dev/tty; } 2>/dev/null
+}
+
+# Asks a yes/no question on the terminal. Only y or yes is a yes.
+ask_yes() {
+  local answer=""
+  printf '   %s [y/N] ' "$1" >&2
+  if [[ -t 0 ]]; then
+    read -r answer || answer=""
+  else
+    read -r answer < /dev/tty || answer=""
+  fi
+  [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# Approves a step with --auto-approve or a yes at the prompt, and stops the
+# script (nothing changed yet) otherwise.
+approve() {
+  local step="$1"
+  local question="$2"
+  local approved_detail="$3"
+  local declined="$4"     # what the customer can do instead
+
+  if [[ "$AUTO_APPROVE" == true ]]; then
+    echo "   Auto-approved (--auto-approve)." >&2
+    record_step "$step" "ok" true "$approved_detail (auto-approved)"
+    return 0
+  fi
+  if ! has_terminal; then
+    echo "   No terminal to ask for approval." >&2
+    record_step "$step" "failed" true \
+      "no terminal to ask; nothing was changed. Rerun in a terminal, or add --auto-approve"
+    error "no terminal to ask for approval. Nothing was changed."
+    echo "  Rerun in a terminal, or add --auto-approve to approve without a prompt." >&2
+    exit 1
+  fi
+  if ask_yes "$question"; then
+    record_step "$step" "ok" true "$approved_detail"
+    return 0
+  fi
+  record_step "$step" "failed" true "not approved; nothing was changed. $declined"
+  error "not approved. Nothing was changed."
+  echo "  $declined" >&2
+  exit 1
 }
 
 make_role_definition() {
@@ -734,20 +939,34 @@ OPTIMIZATION_DESCRIPTION="Lucidity optimization: write and delete permissions fo
 # Every subscription this run onboards, with the scope it came from.
 # Subscriptions that aren't enabled, or that your account can't see, are
 # skipped and reported.
+# An excluded subscription is listed too, so the report shows it. The
+# optional fourth argument is the subscription's parent management groups,
+# so excluding a nested group excludes everything under it.
 add_target() {
   local scope_id="$1"
   local sub="$2"
   local all_subs="$3"
-  local info status reason="" details
+  local parents="${4:-[]}"
+  local info status reason="" details excluded_by
 
   if jq -e --arg s "$sub" 'select((.subscriptionId | ascii_downcase) == ($s | ascii_downcase))' \
       "$TARGETS_FILE" >/dev/null 2>&1; then
     return 0   # already listed under an earlier scope
   fi
 
+  excluded_by=$(jq -rn --arg s "$sub" --argjson parents "$parents" \
+    --argjson excluded "$(to_json_list "$EXCLUDE_IDS")" '
+    [$excluded[] | select(ascii_downcase as $e
+      | ($s | ascii_downcase) == $e or any($parents[]; ascii_downcase == $e))][0] // empty')
+
   info=$(jq -c --arg s "$sub" \
     '[.[] | select((.id | ascii_downcase) == ($s | ascii_downcase))][0] // empty' <<< "$all_subs")
-  if [[ -z "$info" ]]; then
+  if [[ -n "$excluded_by" ]]; then
+    status="excluded"
+    reason="excluded by --exclude-ids"
+    [[ "$excluded_by" != "$sub" ]] && reason="$reason (under $excluded_by)"
+    echo "$excluded_by" >> "$WORK_DIR/excludes-matched"
+  elif [[ -z "$info" ]]; then
     status="skipped"
     reason="not found, or your account can't access it"
   elif [[ "$(jq -r .state <<< "$info")" != Enabled ]]; then
@@ -775,6 +994,7 @@ add_target() {
 }
 
 progress "Finding target subscriptions..."
+: > "$WORK_DIR/excludes-matched"
 if ! ALL_SUBS=$(az account list --all \
     --query "[?tenantId=='$TENANT_ID'].{id: id, name: name, state: state}" \
     -o json --only-show-errors 2>"$WORK_DIR/err"); then
@@ -782,7 +1002,11 @@ if ! ALL_SUBS=$(az account list --all \
   exit 1
 fi
 
-if [[ "$SCOPE_TYPE" == subscription ]]; then
+if [[ "$SCOPE_TYPE" == subscription && "$ALL_SUBSCRIPTIONS" == true ]]; then
+  for sub in $(jq -r '.[].id' <<< "$ALL_SUBS"); do
+    add_target "$sub" "$sub" "$ALL_SUBS"
+  done
+elif [[ "$SCOPE_TYPE" == subscription ]]; then
   for id in "${SCOPE_ID_LIST[@]}"; do
     add_target "$id" "$id" "$ALL_SUBS"
   done
@@ -792,6 +1016,28 @@ else
     error "could not list management groups: $(cat "$WORK_DIR/err")"
     exit 1
   fi
+  # Without scope IDs: the top management groups the account can access,
+  # which is the tenant root group if it can access that. Everything nested
+  # under them is included.
+  if [[ "$ALL_SUBSCRIPTIONS" == true ]]; then
+    read -ra SCOPE_ID_LIST <<< "$(jq -r '
+      [.[] | select(.type == "Microsoft.Management/managementGroups"
+                    and (.permissions // "view") != "noaccess")] as $mgs
+      | [$mgs[].name] as $names
+      | [$mgs[] | select(any((.parentNameChain // [])[]; . as $p | $names | index($p)) | not)
+         | .name] | join(" ")' <<< "$ENTITIES")"
+    if [[ ${#SCOPE_ID_LIST[@]} -eq 0 ]]; then
+      error "no management groups found that your account can access."
+      echo "  Give the management group IDs with --scope-ids, or run with -h to see all options." >&2
+      exit 1
+    fi
+    warn "no --scope-ids given, so this uses the top management groups you can access: ${SCOPE_ID_LIST[*]}." \
+      "Giving the management group IDs with --scope-ids is recommended."
+  fi
+
+  # A management group that can't be found is reported, and the run goes on
+  # with the others.
+  missing=()
   for id in "${SCOPE_ID_LIST[@]}"; do
     if ! jq -e --arg mg "$id" \
         'any(.[]; .type == "Microsoft.Management/managementGroups" and .name == $mg)' \
@@ -799,77 +1045,140 @@ else
       record_step "Management group $id" "failed" true \
         "not found, or your account can't access it"
       error "management group '$id' not found, or your account can't access it."
+      missing+=("$id")
       continue
     fi
     subs=$(jq -r --arg mg "$id" '.[]
       | select(.type == "/subscriptions" and any((.parentNameChain // [])[]; . == $mg))
-      | .name' <<< "$ENTITIES")
+      | [.name, (.parentNameChain // [] | tojson)] | @tsv' <<< "$ENTITIES")
     if [[ -z "$subs" ]]; then
       record_step "Management group $id" "warning" false "no subscriptions found under it"
       continue
     fi
-    for sub in $subs; do
-      add_target "$id" "$sub" "$ALL_SUBS"
-    done
+    while IFS=$'\t' read -r sub parents; do
+      add_target "$id" "$sub" "$ALL_SUBS" "$parents"
+    done <<< "$subs"
   done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "  --scope-ids takes management group IDs (not display names). To list them:" >&2
+    echo "    az account management-group list --query \"[].{id: name, displayName: displayName}\" -o table" >&2
+    echo "  Run with -h to see all options, or contact your Lucidity representative." >&2
+  fi
+
+  # Subscriptions the account can access outside those groups aren't
+  # onboarded; they're listed so the customer knows.
+  if [[ "$ALL_SUBSCRIPTIONS" == true ]]; then
+    for sub in $(jq -r '.[] | select(.state == "Enabled") | .id' <<< "$ALL_SUBS"); do
+      jq -e --arg s "$sub" 'select(.subscriptionId == $s)' "$TARGETS_FILE" >/dev/null 2>&1 && continue
+      jq -nc --arg sub "$sub" --arg name "$(jq -r --arg s "$sub" '.[] | select(.id == $s) | .name' <<< "$ALL_SUBS")" \
+        '{scopeId: $sub, subscriptionId: $sub, name: $name, state: "Enabled", status: "skipped",
+          reason: "not under a management group your account can access"}' >> "$TARGETS_FILE"
+      record_step "Subscription $sub" "warning" false \
+        "skipped: not under a management group your account can access"
+    done
+  fi
 fi
 
 ELIGIBLE=$(jq -s '[.[] | select(.status == "eligible")] | length' "$TARGETS_FILE")
 
 echo "" >&2
-progress "Targets ($SCOPE_TYPE):"
-jq -r '"   \(.subscriptionId) \(if .name != "" then "(\(.name)) " else "" end)under \(.scopeId): "
-  + (if .status == "eligible" then "onboard" else "skip, \(.reason)" end)' \
+if [[ "$ALL_SUBSCRIPTIONS" == true && "$SCOPE_TYPE" == management-group ]]; then
+  progress "Targets: every management group you can access in tenant $TENANT_ID (top level: ${SCOPE_ID_LIST[*]})"
+elif [[ "$ALL_SUBSCRIPTIONS" == true ]]; then
+  progress "Targets: every subscription you can access in tenant $TENANT_ID"
+else
+  progress "Targets ($SCOPE_TYPE):"
+fi
+jq -r --arg verb "$([[ "$NETWORK_CHECK_ONLY" == true ]] && echo check || echo onboard)" \
+  '"   \(.subscriptionId)" + (if .name != "" then " (\(.name))" else "" end)
+  + (if .scopeId != .subscriptionId then " under \(.scopeId)" else "" end) + ": "
+  + (if .status == "eligible" then $verb else "skip, \(.reason)" end)' \
   "$TARGETS_FILE" >&2
+
+# An excluded ID that matched nothing is probably a typo.
+for id in ${EXCLUDE_ID_LIST[@]+"${EXCLUDE_ID_LIST[@]}"}; do
+  if ! jq -Rse --arg e "$id" 'split("\n") | any(ascii_downcase == ($e | ascii_downcase))' \
+      "$WORK_DIR/excludes-matched" >/dev/null; then
+    record_step "Exclude $id" "warning" false "matched no target subscription, so nothing was excluded for it"
+    warn "--exclude-ids: '$id' matched no target subscription, so nothing was excluded for it." \
+      "Check the ID."
+  fi
+done
+
+# A management group ID given as a subscription isn't found.
+if [[ "$SCOPE_TYPE" == subscription && "$ALL_SUBSCRIPTIONS" != true ]] &&
+    jq -se 'any(.[]; .state == "unknown" and .status == "skipped")' "$TARGETS_FILE" >/dev/null; then
+  warn "some subscriptions weren't found." \
+    "If those are management group IDs, rerun without --scope-type subscription."
+fi
 
 if [[ "$ELIGIBLE" -eq 0 ]]; then
   error "no subscriptions to onboard."
   exit 1
 fi
 
-# ---------- Mode ----------
-if [[ "$MODE" == visibility ]]; then
+# ---------- Approval ----------
+# Nothing has been changed yet. Optimization access needs approval; so does
+# the subscription list when no scope IDs were given. In optimization mode
+# one prompt covers both.
+SCOPE_NOTE="No --scope-ids given, so this onboards every subscription listed above."
+if [[ "$NETWORK_CHECK_ONLY" == true ]]; then
+  progress "Network check only: no roles are granted; storage firewall changes are asked for below"
+elif [[ "$MODE" == visibility ]]; then
   progress "Mode: visibility (read access, guest insights and blob visibility only)"
-  if [[ "$OPTIMIZATION_FEATURES_IGNORED" == true ]]; then
-    echo "   Optimization features are ignored in visibility mode." >&2
+  if [[ -n "$MODULES_OPTION" ]]; then
+    echo "   --feature-modules applies to optimization mode only, so it's ignored." >&2
   fi
 elif [[ ${#FEATURES[@]} -eq 0 ]]; then
-  progress "Mode: optimization, but no optimization features are selected"
-else
-  # Approval gate: nothing has been changed yet.
+  progress "Mode: optimization, but no feature modules are selected"
+fi
+
+if [[ "$NETWORK_CHECK_ONLY" == true && "$ALL_SUBSCRIPTIONS" != true ]]; then
+  :   # the storage prompt is the only approval needed
+elif [[ "$NETWORK_CHECK_ONLY" == true ]]; then
+  echo "" >&2
+  echo "${BOLD}No --scope-ids given, so this checks storage accounts in every subscription listed above.${RESET}" >&2
+  approve "Subscription list approval" "Check storage accounts in these $ELIGIBLE subscription(s)?" \
+    "approved $ELIGIBLE subscription(s)" \
+    "Approve at the prompt, or name the subscriptions with --scope-ids or leave some out with --exclude-ids."
+elif [[ "$MODE" == optimization && ${#FEATURES[@]} -gt 0 ]]; then
   echo "" >&2
   echo "${BOLD}==============================================================" >&2
   echo " Mode: optimization${RESET}" >&2
   echo " Lucidity will get write and delete permissions on $ELIGIBLE subscription(s)" >&2
-  echo " for: $FEATURE_LIST." >&2
+  echo " for these feature modules: $FEATURE_LIST." >&2
   echo " These cover resources such as disks, snapshots, virtual machines," >&2
   echo " resource locks and storage accounts. The full list is in this script," >&2
   echo " under 'Optimization selections'." >&2
   if [[ "$BLOB_SETUP" == script && "$BLOBS" == true ]]; then
-    echo " Blob optimization (BLOBS) includes container and blob service write" >&2
-    echo " permissions, even with BLOB_SETUP=script." >&2
+    echo " Blob optimization includes container and blob service write" >&2
+    echo " permissions, even with --blob-setup script." >&2
   fi
-  echo " For read-only visibility instead, set MODE=\"visibility\" and rerun." >&2
+  [[ "$ALL_SUBSCRIPTIONS" == true ]] && echo " $SCOPE_NOTE" >&2
+  echo " For read-only visibility instead, rerun with --mode visibility." >&2
   echo "${BOLD}==============================================================${RESET}" >&2
-  approved=false
-  if [[ "$AUTO_APPROVE_OPTIMIZATION" == true ]]; then
-    approved=true
-    echo "   Auto-approved (AUTO_APPROVE_OPTIMIZATION=true)." >&2
-  elif [[ -t 0 ]]; then
-    printf "   Grant optimization access? [y/N] " >&2
-    read -r answer || answer=""
-    [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]] && approved=true
-  else
-    echo "   No terminal to ask for approval." >&2
-  fi
+  question="Grant optimization access?"
+  [[ "$ALL_SUBSCRIPTIONS" == true ]] &&
+    question="Grant optimization access on these $ELIGIBLE subscription(s)?"
+  approve "Optimization mode approval" "$question" "approved for: $FEATURE_LIST" \
+    "Approve at the prompt, or rerun with --mode visibility."
+elif [[ "$ALL_SUBSCRIPTIONS" == true ]]; then
+  echo "" >&2
+  echo "${BOLD}$SCOPE_NOTE${RESET}" >&2
+  approve "Subscription list approval" "Onboard these $ELIGIBLE subscription(s)?" \
+    "approved $ELIGIBLE subscription(s)" \
+    "Approve at the prompt, or name the subscriptions with --scope-ids or leave some out with --exclude-ids."
+fi
 
-  if [[ "$approved" != true ]]; then
-    record_step "Optimization mode approval" "failed" true \
-      "not approved; nothing was changed. Approve at the prompt, set AUTO_APPROVE_OPTIMIZATION=true, or use MODE=visibility"
-    error "optimization access not approved. Nothing was changed."
-    exit 1
-  fi
-  record_step "Optimization mode approval" "ok" true "approved for: $FEATURE_LIST"
+# ---------- Lucidity's service principal ----------
+# Only after approval: finding it may create it in your tenant.
+# A network check only run grants nothing, so it skips this and the role
+# steps below.
+if [[ "$NETWORK_CHECK_ONLY" != true ]]; then
+  echo "" >&2
+  progress "Resolving Lucidity's service principal..."
+  resolve_sp
+  echo "   Service principal object ID: $SP_OBJECT_ID" >&2
 fi
 
 # ---------- Reservations Reader ----------
@@ -878,7 +1187,9 @@ fi
 # It is tenant-wide, so it's assigned once per run. Assigning it requires
 # tenant-level permission, so a failure is a warning and the script continues.
 # It is passed by name: az doesn't recognize a role ID starting with /providers/.
-if assign_role "Reservations Reader" "Reservations Reader" \
+if [[ "$NETWORK_CHECK_ONLY" == true ]]; then
+  :
+elif assign_role "Reservations Reader" "Reservations Reader" \
     "/providers/Microsoft.Capacity" false; then
   RESERVATIONS_READER="assigned"
 else
@@ -920,7 +1231,7 @@ onboard_subscription() {
     progress "$sub already has subscription-level Lucidity roles; keeping and updating them"
   else
     home="/providers/Microsoft.Management/managementGroups/$scope_id"
-    suffix="$scope_id"; roles_at="management_group"
+    suffix="$scope_id"; roles_at="management-group"
   fi
   jq -nc --arg sub "$sub" --arg rolesAt "$roles_at" \
     '{subscriptionId: $sub, rolesAt: $rolesAt}' > "$WORK_DIR/roles-at-$sub.json"
@@ -937,16 +1248,16 @@ onboard_subscription() {
       "$sub_scope/providers/Microsoft.Authorization/roleDefinitions/$role_id" \
       "$sub_scope" true "$condition"
 
-    # Switching to BLOB_SETUP=script doesn't take away the write permissions
+    # Switching to blob setup by the script doesn't take away the write permissions
     # an earlier run granted; the script reports them once per role.
     if [[ "$BLOB_SETUP" == script && ! -f "$WORK_DIR/role-$role_name.noted" ]] &&
         role_has_blob_setup_actions "$role_name"; then
       touch "$WORK_DIR/role-$role_name.noted"
       record_step "Blob setup permissions in $role_name" "ok" false \
-        "still has container and blob service write permissions from an earlier run; BLOB_SETUP=script does not remove them"
+        "still has container and blob service write permissions from an earlier run; --blob-setup script does not remove them"
       echo "" >&2
       echo "${YELLOW}NOTE: $role_name still has container and blob service write" >&2
-      echo "  permissions from an earlier run. BLOB_SETUP=script does not remove them.${RESET}" >&2
+      echo "  permissions from an earlier run. --blob-setup script does not remove them.${RESET}" >&2
     fi
   fi
 
@@ -977,20 +1288,22 @@ onboard_subscription() {
   fi
 }
 
-while IFS=$'\t' read -r scope_id sub; do
-  echo "" >&2
-  progress "Subscription $sub"
-  run_contained onboard_subscription "$scope_id" "$sub"
-  if [[ "$CONTAINED_RC" -eq 0 ]]; then
-    result="onboarded"
-  else
-    result="failed"
-  fi
-  jq -c --arg result "$result" '. + {result: $result}' \
-    "$WORK_DIR/roles-at-$sub.json" 2>/dev/null >> "$RESULTS_FILE" ||
-    jq -nc --arg sub "$sub" --arg result "$result" \
-      '{subscriptionId: $sub, result: $result}' >> "$RESULTS_FILE"
-done < <(jq -r 'select(.status == "eligible") | [.scopeId, .subscriptionId] | @tsv' "$TARGETS_FILE")
+if [[ "$NETWORK_CHECK_ONLY" != true ]]; then
+  while IFS=$'\t' read -r scope_id sub; do
+    echo "" >&2
+    progress "Subscription $sub"
+    run_contained onboard_subscription "$scope_id" "$sub"
+    if [[ "$CONTAINED_RC" -eq 0 ]]; then
+      result="onboarded"
+    else
+      result="failed"
+    fi
+    jq -c --arg result "$result" '. + {result: $result}' \
+      "$WORK_DIR/roles-at-$sub.json" 2>/dev/null >> "$RESULTS_FILE" ||
+      jq -nc --arg sub "$sub" --arg result "$result" \
+        '{subscriptionId: $sub, result: $result}' >> "$RESULTS_FILE"
+  done < <(jq -r 'select(.status == "eligible") | [.scopeId, .subscriptionId] | @tsv' "$TARGETS_FILE")
+fi
 
 
 # ---------- Storage accounts ----------
@@ -998,15 +1311,17 @@ done < <(jq -r 'select(.status == "eligible") | [.scopeId, .subscriptionId] | @t
 # subscriptions.
 #
 # Firewall rules (STORAGE_NETWORK_CHECK). Lucidity reads blob inventory over
-# the storage data plane, which a storage firewall can block. Lucidity's
-# network tests (outbound via load balancer, Regional service endpoint):
-#   - Accounts in Lucidity's region (and possibly its paired region) see
-#     Lucidity's subnet, so the subnet rule applies.
+# the storage data plane, which a storage firewall can block (outbound via
+# load balancer, Regional service endpoint):
+#   - Accounts in LUCIDITY_SUBNET_REGIONS see Lucidity's subnet through the
+#     service endpoint, so the subnet rule applies. They get the IP rule too,
+#     which costs nothing.
 #   - Accounts in other regions see Lucidity's public IP, so the IP rule
-#     applies.
-# Adding both to every firewalled account covers either case. Only Lucidity's
-# own rules are added or removed; defaultAction and publicNetworkAccess are
-# never changed.
+#     applies; Azure rejects the subnet rule there.
+#   - With public network access disabled, only a private endpoint can reach
+#     an account, so those are only reported.
+# Only Lucidity's own rules are added or removed; defaultAction and
+# publicNetworkAccess are never changed.
 #
 # Blob setup (BLOB_SETUP=script): the lucidity-inventory container and last
 # access time tracking. These are management operations, so a storage
@@ -1018,30 +1333,23 @@ done < <(jq -r 'select(.status == "eligible") | [.scopeId, .subscriptionId] | @t
 # tracking.
 BLOB_SETUP_KINDS='["StorageV2","BlobStorage","BlockBlobStorage"]'
 
-# What the customer should do about an account that needs attention.
+# What the customer should do about storage accounts that need attention,
+# by reason.
 storage_note() {
-  local status="$1"
-  local setup_status="$2"
-  local result="$3"
-  local notes=()
-
-  case "$status" in
+  case "$1" in
     public_access_disabled)
-      notes+=("Public network access is disabled. Allow selected networks and rerun, or ask Lucidity about a private endpoint.") ;;
+      echo "Public network access is disabled, so Lucidity can't reach them. To include them, allow selected networks and rerun." ;;
     network_perimeter)
-      notes+=("Secured by a network security perimeter. Add Lucidity to the perimeter's access rules.") ;;
+      echo "Secured by a network security perimeter. Add Lucidity to the perimeter's access rules." ;;
     not_found)
-      notes+=("Not found in the target subscriptions. Check the name in STORAGE_ACCOUNTS.") ;;
-  esac
-  [[ "$setup_status" == check_failed ]] &&
-    notes+=("Couldn't check the container or last access time tracking; see the report.")
-  case "$result" in
+      echo "Not found in the target subscriptions. Check the names in STORAGE_ACCOUNTS." ;;
+    check_failed)
+      echo "Couldn't check the container or last access time tracking; see the report." ;;
     pending_approval)
-      notes+=("Changes not made. Rerun and approve, or set AUTO_APPROVE_STORAGE_CHANGES=true.") ;;
+      echo "Changes not made. Rerun and approve them at the prompt." ;;
     failed)
-      notes+=("Some changes failed; see the report for the error.") ;;
+      echo "Some changes failed; see the report for the error." ;;
   esac
-  echo "${notes[*]:-}"
 }
 
 # Runs one planned change on a storage account. Prints Azure's error on
@@ -1058,17 +1366,14 @@ apply_storage_action() {
     ip|subnet)
       local flag="--ip-address"
       [[ "$type" == subnet ]] && flag="--subnet"
-      progress "${name}: ${op} ${type} rule ${value}..."
       az storage account network-rule "$op" --subscription "$sub" \
         -g "$rg" --account-name "$name" "$flag" "$value" \
         --only-show-errors 2>&1 >/dev/null </dev/null ;;
     container)
-      progress "${name}: creating container ${value}..."
       az storage container-rm create --subscription "$sub" -g "$rg" \
         --storage-account "$name" -n "$value" \
         --only-show-errors 2>&1 >/dev/null </dev/null ;;
     last_access_tracking)
-      progress "${name}: enabling last access time tracking..."
       az storage account blob-service-properties update --subscription "$sub" \
         -g "$rg" -n "$name" --enable-last-access-tracking true \
         --only-show-errors 2>&1 >/dev/null </dev/null ;;
@@ -1079,10 +1384,12 @@ check_storage() {
   local network="$STORAGE_NETWORK_CHECK" setup=false
   local accounts_file="$WORK_DIR/accounts.jsonl"
   local checked_file="$WORK_DIR/accounts-checked.jsonl"
-  local listed plan pending answer apply=false sub record name rg
+  local listed plan pending apply=false sub record name rg
   local op type value err failures attention total lat exists check_err
+  local done_count=0 reason count
 
-  [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == script ]] && setup=true
+  [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == script &&
+     "$NETWORK_CHECK_ONLY" != true ]] && setup=true
 
   if [[ "$network" == true &&
         "$(date -u +%Y-%m-%d)" > "$LUCIDITY_EGRESS_IPS_VALID_UNTIL" ]]; then
@@ -1094,8 +1401,8 @@ check_storage() {
 
   echo "" >&2
   : > "$accounts_file"
+  progress "Listing storage accounts in $(jq -s '[.[] | select(.status == "eligible")] | length' "$TARGETS_FILE") subscription(s)..."
   for sub in $(jq -r 'select(.status == "eligible") | .subscriptionId' "$TARGETS_FILE"); do
-    progress "Listing storage accounts in $sub..."
     if ! listed=$(az storage account list --subscription "$sub" \
         --query "[].{name: name, resourceGroup: resourceGroup, location: location, kind: kind,
           publicNetworkAccess: publicNetworkAccess,
@@ -1115,6 +1422,8 @@ check_storage() {
 
   # Blob setup needs each account's current container and tracking state.
   : > "$checked_file"
+  [[ "$setup" == true ]] &&
+    progress "Checking blob setup on $(jq -s length "$accounts_file") storage account(s)..."
   while IFS= read -r record; do
     if [[ "$setup" == true ]] &&
         jq -e --argjson k "$BLOB_SETUP_KINDS" '.kind as $kind | any($k[]; . == $kind)' \
@@ -1122,7 +1431,6 @@ check_storage() {
       sub=$(jq -r .subscriptionId <<< "$record")
       name=$(jq -r .name <<< "$record")
       rg=$(jq -r .resourceGroup <<< "$record")
-      progress "Checking blob setup on $name..."
       check_err=""
       if ! lat=$(az storage account blob-service-properties show --subscription "$sub" \
           -g "$rg" -n "$name" --query "lastAccessTimeTrackingPolicy.enable" -o tsv \
@@ -1206,46 +1514,65 @@ check_storage() {
   total=$(jq length <<< "$plan")
   pending=$(jq '[.[] | select(.actions != [])] | length' <<< "$plan")
 
+  # Counts only: per-account details are in the report.
   echo ""
   echo "${BOLD}>> Storage accounts: $total${RESET}"
   if [[ "$network" == true ]]; then
-    echo "   Firewall rules for Lucidity, on accounts whose firewall allows only selected networks:"
-    if [[ -n "${LUCIDITY_EGRESS_IPS//[ ,]/}" ]]; then
-      echo "   - IP rule (Lucidity's outbound IP) on every such account"
-    fi
-    if [[ -z "${LUCIDITY_SUBNET_IDS//[ ,]/}" || -z "${LUCIDITY_SUBNET_REGIONS//[ ,]/}" ]]; then
-      :
-    elif [[ "$LUCIDITY_SUBNET_REGIONS" == *"*"* ]]; then
-      echo "   - subnet rule (Lucidity's subnet) on every such account"
-    else
-      echo "   - subnet rule (Lucidity's subnet) where its service endpoint reaches:"
-      echo "     $(tr -s ' ,' ' ' <<< "$LUCIDITY_SUBNET_REGIONS")"
-      echo "     (Azure rejects a subnet rule on accounts in other regions, so they get the IP rule only)"
+    jq -r '
+      def count(f): [.[] | select(f)] | length;
+      def rules(t): count(any(.actions[]; .type == t and .op == "add"));
+      "   Firewall:",
+      "   - nothing needed: \(count(.status | IN("open", "already_allowed", "not_applicable")))"
+        + " (open to all networks, already allowing Lucidity, or file shares only)",
+      "   - need Lucidity'"'"'s rules: \(count(.status == "needs_rule"))"
+        + (if count(.status == "needs_rule") > 0
+           then " (IP rule: \(rules("ip")), subnet rule: \(rules("subnet"))"
+             + (if count(any(.actions[]; .type == "ip" and .op == "remove")) > 0
+                then ", old Lucidity IP removed: \(count(any(.actions[]; .type == "ip" and .op == "remove")))"
+                else "" end) + ")"
+           else "" end),
+      (if count(.status | IN("public_access_disabled", "network_perimeter")) > 0 then
+        "   - need manual action: \(count(.status | IN("public_access_disabled", "network_perimeter")))"
+        + " (" + ([(count(.status == "public_access_disabled") | select(. > 0)
+                    | "public access disabled: \(.)"),
+                   (count(.status == "network_perimeter") | select(. > 0)
+                    | "network security perimeter: \(.)")] | join(", ")) + ")"
+       else empty end),
+      (if count(.status == "not_found") > 0 then
+        "   - not found: \(count(.status == "not_found"))" else empty end)' <<< "$plan"
+    if [[ -n "${LUCIDITY_SUBNET_IDS//[ ,]/}" && -n "${LUCIDITY_SUBNET_REGIONS//[ ,]/}" &&
+          "$LUCIDITY_SUBNET_REGIONS" != *"*"* ]]; then
+      echo "   Subnet rules go only on accounts in $(tr -s ' ,' ' ' <<< "$LUCIDITY_SUBNET_REGIONS" | sed 's/ /, /g')."
+      echo "   Azure rejects them in other regions, so those accounts get the IP rule only."
     fi
   fi
-  jq -r --argjson network "$network" --argjson setup "$setup" '.[]
-    | "   \(.name) [\(.location // "-")] in \(.subscriptionId // "-"): "
-      + ([(if $network or .status == "not_found" then "firewall \(.status)"
-             + (if (.status == "needs_rule" or .status == "already_allowed") and .ipOnly
-                then " (IP rule only: \(.location) is outside the subnet endpoint'"'"'s regions)" else "" end)
-           else empty end),
-          (if $setup and .status != "not_found" then "blob setup \(.setupStatus)" else empty end)]
-         | join(", ")),
-      (.actions[] | "      will "
-        + (if .type == "container" then "create container \(.value)"
-           elif .type == "last_access_tracking" then "enable last access time tracking"
-           else "\(.op) \(.type) rule \(.value)" end))' <<< "$plan"
+  if [[ "$setup" == true ]]; then
+    jq -r '
+      def count(f): [.[] | select(f)] | length;
+      "   Blob setup:",
+      "   - ready: \(count(.setupStatus == "ready"))",
+      "   - need setup: \(count(.setupStatus == "needs_setup"))"
+        + " (create the \($c) container: \(count(any(.actions[]; .type == "container"))),"
+        + " enable last access time tracking: \(count(any(.actions[]; .type == "last_access_tracking"))))",
+      (if count(.setupStatus == "not_supported") > 0 then
+        "   - not supported (account kind): \(count(.setupStatus == "not_supported"))" else empty end),
+      (if count(.setupStatus == "check_failed") > 0 then
+        "   - couldn'"'"'t check: \(count(.setupStatus == "check_failed"))" else empty end)' \
+      --arg c "$INVENTORY_CONTAINER" <<< "$plan"
+  fi
+  echo "   Each account's details are in the report."
 
+  # Unlike the approvals above, a no here doesn't stop the run: the roles
+  # are already in place.
   if [[ "$pending" -gt 0 ]]; then
-    if [[ "$AUTO_APPROVE_STORAGE_CHANGES" == true ]]; then
+    if [[ "$AUTO_APPROVE" == true ]]; then
       apply=true
-      echo "   Auto-approved (AUTO_APPROVE_STORAGE_CHANGES=true)."
-    elif [[ -t 0 ]]; then
-      printf "   Apply these changes on %s storage account(s)? [y/N] " "$pending"
-      read -r answer || answer=""
-      [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]] && apply=true
+      echo "   Auto-approved (--auto-approve)."
+    elif has_terminal; then
+      ask_yes "Apply these changes on $pending storage account(s)?" && apply=true
     else
       echo "   No terminal to ask for approval, so nothing was changed."
+      echo "   Rerun in a terminal, or add --auto-approve."
     fi
   fi
 
@@ -1262,6 +1589,9 @@ check_storage() {
     sub=$(jq -r .subscriptionId <<< "$record")
     name=$(jq -r .name <<< "$record")
     rg=$(jq -r .resourceGroup <<< "$record")
+    # One line, updated in place on a terminal.
+    done_count=$((done_count + 1))
+    [[ -t 2 ]] && printf '\r   Updating storage account %d of %d...' "$done_count" "$pending" >&2
     failures=""
     while IFS=$'\t' read -r op type value; do
       if ! err=$(apply_storage_action "$sub" "$rg" "$name" "$op" "$type" "$value"); then
@@ -1276,6 +1606,11 @@ check_storage() {
         <<< "$record" >> "$STORAGE_FILE"
     fi
   done < <(jq -c '.[]' <<< "$plan")
+  if [[ "$apply" == true ]]; then
+    [[ -t 2 ]] && echo "" >&2
+    echo "   Applied on $(jq -s '[.[] | select(.result == "applied")] | length' "$STORAGE_FILE")," \
+      "failed on $(jq -s '[.[] | select(.result == "failed")] | length' "$STORAGE_FILE")."
+  fi
 
   attention=$(jq -sc '[.[] | select(
       (.status | IN("public_access_disabled", "network_perimeter", "not_found"))
@@ -1291,10 +1626,14 @@ check_storage() {
   record_step "Storage check" "warning" false \
     "$(jq length <<< "$attention") of $total account(s) need attention (see storage in the report)"
   echo ""
-  echo "${YELLOW}   Storage accounts that need attention:"
-  while IFS=$'\t' read -r name status setup_status result; do
-    echo "   - $name: $(storage_note "$status" "$setup_status" "$result")"
-  done < <(jq -r '.[] | [.name, .status, .setupStatus, .result] | @tsv' <<< "$attention")
+  echo "${YELLOW}   Storage accounts that need attention: $(jq length <<< "$attention")" \
+    "(the report lists them)"
+  while IFS=$'\t' read -r count reason; do
+    echo "   - $count: $(storage_note "$reason")"
+  done < <(jq -r '[.[] | (.status | select(IN("public_access_disabled", "network_perimeter", "not_found"))),
+      (select(.setupStatus == "check_failed") | "check_failed"),
+      (.result | select(IN("pending_approval", "failed")))]
+    | group_by(.) | .[] | [length, .[0]] | @tsv' <<< "$attention")
   printf '%s' "$RESET"
 }
 
@@ -1309,6 +1648,7 @@ fi
 if [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == script ]]; then
   RUN_STORAGE=true
 fi
+[[ "$NETWORK_CHECK_ONLY" == true ]] && RUN_STORAGE=true
 
 if [[ "$RUN_STORAGE" == true ]]; then
   set +e
