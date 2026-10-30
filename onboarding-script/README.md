@@ -166,39 +166,54 @@ account needs depends on its public network access setting:
 | Public network access | What Lucidity needs |
 |---|---|
 | Enabled from all networks | Nothing |
-| Enabled from selected networks | Lucidity's firewall rules, by region (below) |
+| Enabled from selected networks | A firewall rule for Lucidity's subnet, in every region |
 | Disabled | Lucidity can't reach the account: only a private endpoint could, and Lucidity doesn't offer one. Out of scope unless you allow selected networks |
 
-For selected networks, the rules depend on where the account is:
-
-| Account region | Rules added | Why |
-|---|---|---|
-| East US, West US, West US 3 | Subnet rule and IP rule | Lucidity's traffic arrives through its subnet's service endpoint, so the subnet rule is the one that lets it in. The IP rule has no effect there |
-| Any other region | IP rule only | Lucidity's traffic arrives from its outbound IP. Azure rejects the subnet rule in these regions |
+Lucidity's traffic arrives through its subnet's service endpoint, which
+reaches storage accounts in every region, so the subnet rule is all it
+needs.
 
 The script checks every storage account in the onboarded subscriptions,
-shows how many need each rule, and asks once before adding them. The report
+shows how many need changes, and asks once before making them. The report
 lists each account's status and what was changed.
 
 Already onboarded, and only need the firewall rules (for example, after
-adding storage accounts)? Run with `--network-check-only`.
+adding storage accounts, or to move from the IP rule to the subnet rule)?
+Run with `--network-check-only`.
 
 | Status | Meaning | What happens |
 |---|---|---|
 | `open` | Firewall allows all networks | Nothing needed |
 | `already_allowed` | Lucidity's rules are already in place | Nothing needed |
-| `needs_rule` | Firewall allows selected networks and a Lucidity rule is missing | The missing rules are added, after your approval |
+| `needs_rule` | Firewall allows selected networks and Lucidity's rule is missing, or an old Lucidity rule is still there | The subnet rule is added and old Lucidity rules removed, after your approval |
 | `public_access_disabled` | Public network access is disabled | Out of scope: Lucidity can't reach it. To include it, allow selected networks and rerun |
 | `network_perimeter` | Secured by a network security perimeter | Manual: add Lucidity to the perimeter's access rules |
 | `not_applicable` | File-share-only account | Nothing needed |
 
-**What it changes:** only Lucidity's own firewall rules are added (or, after
-Lucidity's IP changes, the old Lucidity IP removed). It never changes an
+**What it changes:** only Lucidity's own firewall rules: its subnet rule is
+added, and old Lucidity rules removed. An old rule is removed only after the
+new one is in place. It never changes an
 account's default action or public network access, and never touches your
 own rules. Changes are made with your credentials.
 
 Storage account problems never fail the onboarding: the roles are already in
 place by then. The run finishes as `completed_with_warnings` instead.
+
+### If you ran an earlier version
+
+The version is printed at the start of every run and recorded in the report.
+Versions up to `2026-10-29` added the subnet rule only on storage accounts in
+East US, West US and West US 3, and an IP rule (`4.157.111.90`) on the
+others. Version `2026-10-30` uses the subnet rule everywhere, so **if you
+onboarded with an earlier version, rerun the script** to move your storage
+accounts over:
+
+```bash
+bash lucidity-onboarding.sh --scope-ids="<mg-id-1>,<mg-id-2>" --network-check-only
+```
+
+For each account it adds the subnet rule, and only then removes the old IP
+rule. Roles aren't touched.
 
 ## The report
 
@@ -251,8 +266,6 @@ The report contains no secrets.
   rights. Everything else works.
 - **A step fails with `AuthorizationFailed`**: your account lacks the
   permissions listed in [Before you run it](#before-you-run-it).
-- **"Lucidity's outbound IP was due to change"**: get the latest script
-  before approving firewall rules.
 - **Storage account reported `failed`**: often an Azure Policy blocking
   network rule changes. The report has Azure's error.
 

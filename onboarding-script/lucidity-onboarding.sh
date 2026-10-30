@@ -4,7 +4,7 @@ set -euo pipefail
 # Lucidity's Azure onboarding script. Run it with options instead of editing
 # this file; bash lucidity-onboarding.sh --help lists them. The settings below
 # are the defaults, and options override them.
-SCRIPT_VERSION="2026-10-29"
+SCRIPT_VERSION="2026-10-30"
 
 # ---------- Defaults ----------
 # Access scope: where Lucidity gets access.
@@ -77,27 +77,28 @@ SP_OBJECT_ID=""
 LUCIDITY_APP_ID="4f2c2c1f-372a-4904-b13d-11e2467679f2"
 
 # ---------- Lucidity network details (provided by Lucidity) ----------
-# Every storage account whose firewall allows only selected networks gets an
-# IP rule for Lucidity, and also a subnet rule when Lucidity's subnet can reach
-# its region (LUCIDITY_SUBNET_REGIONS).
+# Every storage account whose firewall allows only selected networks gets a
+# subnet rule for Lucidity's subnet (in LUCIDITY_SUBNET_REGIONS), and an IP
+# rule for each IP in LUCIDITY_EGRESS_IPS. Retired IPs and subnets are
+# removed, after the new rules are in place.
 
-# Lucidity's outbound public IP(s). SUBJECT TO CHANGE: the current IP is
-# expected to change around LUCIDITY_EGRESS_IPS_VALID_UNTIL. When it changes,
-# put the new IP here and move the old one to LUCIDITY_RETIRED_EGRESS_IPS, so
-# a rerun replaces it on customer storage accounts.
-LUCIDITY_EGRESS_IPS="4.157.111.90"
-LUCIDITY_EGRESS_IPS_VALID_UNTIL="2026-11-16"
-LUCIDITY_RETIRED_EGRESS_IPS=""
+# Lucidity's outbound public IP(s). None since the Global service endpoint
+# (2026-10-30): the subnet rule covers every region. If IP rules are ever
+# needed again, put the IPs here and set LUCIDITY_EGRESS_IPS_VALID_UNTIL to
+# the date they're expected to change.
+LUCIDITY_EGRESS_IPS=""
+LUCIDITY_EGRESS_IPS_VALID_UNTIL=""
+LUCIDITY_RETIRED_EGRESS_IPS="4.157.111.90"
 
-# Lucidity's AKS subnet. It has a Regional Microsoft.Storage service endpoint,
-# which Azure only lets storage accounts in LUCIDITY_SUBNET_REGIONS use: a
-# subnet rule on an account in any other region is rejected. Those accounts
-# get the IP rule only.
-# Once the Global endpoint replaces the Regional one, subnet rules cover every
-# region: set LUCIDITY_SUBNET_REGIONS="*", empty LUCIDITY_EGRESS_IPS and move
-# its IPs to LUCIDITY_RETIRED_EGRESS_IPS, so a rerun removes the IP rules.
+# Lucidity's AKS subnet. It has the Microsoft.Storage.Global service endpoint
+# (the Global one; the Regional one is Microsoft.Storage), so Azure accepts
+# its subnet rule on storage accounts in every region ("*"). With a Regional
+# endpoint, Azure rejects the rule outside the endpoint's regions: list those
+# regions here instead.
 LUCIDITY_SUBNET_IDS="/subscriptions/3511ac94-c2ef-4644-8147-55f5f9a27a9e/resourceGroups/azurepls-rg/providers/Microsoft.Network/virtualNetworks/azurepls-vnet/subnets/aks-subnet"
-LUCIDITY_SUBNET_REGIONS="eastus westus westus3"
+LUCIDITY_SUBNET_REGIONS="*"
+# Subnets Lucidity no longer uses; a rerun removes their rules.
+LUCIDITY_RETIRED_SUBNET_IDS=""
 
 # ---------- Output ----------
 # Colours only when both outputs are a terminal and NO_COLOR isn't set.
@@ -396,6 +397,7 @@ finish() {
     --argjson egressIps "$(to_json_list "$LUCIDITY_EGRESS_IPS")" \
     --argjson retiredEgressIps "$(to_json_list "$LUCIDITY_RETIRED_EGRESS_IPS")" \
     --argjson subnetIds "$(to_json_list "$LUCIDITY_SUBNET_IDS")" \
+    --argjson retiredSubnetIds "$(to_json_list "$LUCIDITY_RETIRED_SUBNET_IDS")" \
     --argjson subnetRegions "$(to_json_list "$LUCIDITY_SUBNET_REGIONS")" \
     --slurpfile storage "$STORAGE_FILE" \
     '{
@@ -433,6 +435,7 @@ finish() {
         lucidityEgressIps: $egressIps,
         retiredEgressIps: $retiredEgressIps,
         luciditySubnetIds: $subnetIds,
+        retiredSubnetIds: $retiredSubnetIds,
         luciditySubnetRegions: $subnetRegions,
         accounts: $storage
       } else null end)
@@ -1311,15 +1314,12 @@ fi
 # subscriptions.
 #
 # Firewall rules (STORAGE_NETWORK_CHECK). Lucidity reads blob inventory over
-# the storage data plane, which a storage firewall can block (outbound via
-# load balancer, Regional service endpoint):
-#   - Accounts in LUCIDITY_SUBNET_REGIONS see Lucidity's subnet through the
-#     service endpoint, so the subnet rule applies. They get the IP rule too,
-#     which costs nothing.
-#   - Accounts in other regions see Lucidity's public IP, so the IP rule
-#     applies; Azure rejects the subnet rule there.
-#   - With public network access disabled, only a private endpoint can reach
-#     an account, so those are only reported.
+# the storage data plane, which a storage firewall can block. Lucidity's
+# subnet has a Global service endpoint, so every account sees Lucidity's
+# traffic coming from that subnet, and the subnet rule is what allows it.
+# The IP rules of the earlier Regional setup are removed on a rerun.
+# With public network access disabled, only a private endpoint can reach an
+# account, so those are only reported.
 # Only Lucidity's own rules are added or removed; defaultAction and
 # publicNetworkAccess are never changed.
 #
@@ -1391,7 +1391,8 @@ check_storage() {
   [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == script &&
      "$NETWORK_CHECK_ONLY" != true ]] && setup=true
 
-  if [[ "$network" == true &&
+  if [[ "$network" == true && -n "${LUCIDITY_EGRESS_IPS//[ ,]/}" &&
+        -n "$LUCIDITY_EGRESS_IPS_VALID_UNTIL" &&
         "$(date -u +%Y-%m-%d)" > "$LUCIDITY_EGRESS_IPS_VALID_UNTIL" ]]; then
     record_step "Lucidity egress IP check" "warning" false \
       "LUCIDITY_EGRESS_IPS was due to change on $LUCIDITY_EGRESS_IPS_VALID_UNTIL; IP rules may be outdated."
@@ -1458,6 +1459,7 @@ check_storage() {
     --argjson ips "$(to_json_list "$LUCIDITY_EGRESS_IPS")" \
     --argjson retired "$(to_json_list "$LUCIDITY_RETIRED_EGRESS_IPS")" \
     --argjson subnets "$(to_json_list "$LUCIDITY_SUBNET_IDS")" \
+    --argjson retiredSubnets "$(to_json_list "$LUCIDITY_RETIRED_SUBNET_IDS")" \
     --argjson subnetRegions "$(to_json_list "$LUCIDITY_SUBNET_REGIONS")" \
     --argjson network "$network" \
     --argjson setup "$setup" \
@@ -1475,6 +1477,8 @@ check_storage() {
       if subnet_covers($a) then
         [$subnets[] | select(has_subnet($a; .) | not) | {op: "add", type: "subnet", value: .}]
       else [] end;
+    def subnet_removals($a):
+      [$retiredSubnets[] | select(has_subnet($a; .)) | {op: "remove", type: "subnet", value: .}];
     def network_part($a; $base):
       if ($network | not) then {status: "not_checked", actions: []}
       elif $a.kind == "FileStorage" then {status: "not_applicable", actions: []}
@@ -1482,7 +1486,9 @@ check_storage() {
       elif $base.publicNetworkAccess == "SecuredByPerimeter" then {status: "network_perimeter", actions: []}
       elif $base.defaultAction == "Allow" then {status: "open", actions: []}
       else
-        (subnet_adds($a) + ip_adds($a) + ip_removals($a)) as $actions
+        # Adds come first: the old rules are removed only after the new ones
+        # are in place.
+        (subnet_adds($a) + ip_adds($a) + ip_removals($a) + subnet_removals($a)) as $actions
         | {status: (if $actions == [] then "already_allowed" else "needs_rule" end), actions: $actions}
       end;
     def setup_part($a):
@@ -1524,12 +1530,14 @@ check_storage() {
       "   Firewall:",
       "   - nothing needed: \(count(.status | IN("open", "already_allowed", "not_applicable")))"
         + " (open to all networks, already allowing Lucidity, or file shares only)",
-      "   - need Lucidity'"'"'s rules: \(count(.status == "needs_rule"))"
+      def removals(t): count(any(.actions[]; .type == t and .op == "remove"));
+      "   - need Lucidity'"'"'s rules added or updated: \(count(.status == "needs_rule"))"
         + (if count(.status == "needs_rule") > 0
-           then " (IP rule: \(rules("ip")), subnet rule: \(rules("subnet"))"
-             + (if count(any(.actions[]; .type == "ip" and .op == "remove")) > 0
-                then ", old Lucidity IP removed: \(count(any(.actions[]; .type == "ip" and .op == "remove")))"
-                else "" end) + ")"
+           then " (" + ([(rules("subnet") | select(. > 0) | "subnet rule: \(.)"),
+                         (rules("ip") | select(. > 0) | "IP rule: \(.)"),
+                         (removals("ip") | select(. > 0) | "old Lucidity IP removed: \(.)"),
+                         (removals("subnet") | select(. > 0) | "old Lucidity subnet removed: \(.)")]
+                        | join(", ")) + ")"
            else "" end),
       (if count(.status | IN("public_access_disabled", "network_perimeter")) > 0 then
         "   - need manual action: \(count(.status | IN("public_access_disabled", "network_perimeter")))"
@@ -1593,7 +1601,13 @@ check_storage() {
     done_count=$((done_count + 1))
     [[ -t 2 ]] && printf '\r   Updating storage account %d of %d...' "$done_count" "$pending" >&2
     failures=""
+    # Removing an old rule after a new one failed could cut Lucidity off, so
+    # removals are skipped then.
     while IFS=$'\t' read -r op type value; do
+      if [[ "$op" == remove && -n "$failures" ]]; then
+        failures="${failures}${op} ${type} ${value}: skipped, because an earlier change failed; "
+        continue
+      fi
       if ! err=$(apply_storage_action "$sub" "$rg" "$name" "$op" "$type" "$value"); then
         failures="${failures}${op} ${type} ${value}: ${err}; "
       fi

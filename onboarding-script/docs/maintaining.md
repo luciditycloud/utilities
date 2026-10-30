@@ -83,8 +83,8 @@ status and changes are in the report's `storage.accounts`.
 ## Network check only (`--network-check-only`)
 
 For customers whose roles are already in place but whose storage firewalls
-need Lucidity's rules (for example, new storage accounts, or after
-Lucidity's outbound IP changes). The run finds the target subscriptions as
+need Lucidity's rules (for example, new storage accounts, or to move from
+the IP rule to the subnet rule). The run finds the target subscriptions as
 usual, then does only the storage firewall check and its prompt: it doesn't
 resolve or create the service principal, assign any role, or do blob setup.
 It can't be combined with `--mode`, `--feature-modules`, `--blob-setup` or
@@ -92,79 +92,71 @@ It can't be combined with `--mode`, `--feature-modules`, `--blob-setup` or
 
 ## How Lucidity's traffic reaches a storage account
 
-Lucidity's backend runs in `aks-subnet` (East US), which has a Regional
-`Microsoft.Storage` service endpoint, and goes out to the internet through
-a load balancer with a public IP (`LUCIDITY_EGRESS_IPS`).
+Lucidity's backend runs in `aks-subnet` (`LUCIDITY_SUBNET_IDS`), which has a
+`Microsoft.Storage.Global` service endpoint (the Global one; the Regional
+one is `Microsoft.Storage`) since 2026-10-30. Traffic to storage accounts in every region goes over the
+endpoint, with a private source address, so the subnet rule is what lets it
+in. Azure IP rules don't apply to this traffic.
 
 | Public network access | Result | What the script does |
 |---|---|---|
 | Enabled from all networks | Reachable | Nothing (`open`) |
-| Enabled from selected networks | Reachable once Lucidity's rules are added | Adds the rules (`needs_rule`), by region as below |
+| Enabled from selected networks | Reachable once the subnet rule is added | Adds it (`needs_rule`) |
 | Disabled | Unreachable: Azure ignores firewall rules and allows only private endpoints, and Lucidity has none. Service endpoint traffic is blocked too, as it goes to the public endpoint | Reports it (`public_access_disabled`); out of scope |
 | Secured by a network security perimeter | Depends on the perimeter's access rules | Reports it (`network_perimeter`) |
 
-For selected networks, the region decides which rule works:
+**Before 2026-10-30** the endpoint was Regional (East US). Azure accepted the
+subnet rule only on accounts in East US, West US and West US 3, so accounts
+elsewhere got an IP rule for Lucidity's outbound IP `4.157.111.90` instead,
+and accounts in those three regions got both. Azure rejected the subnet rule
+elsewhere whatever the public access setting (tested 2026-10-24 and
+2026-10-29: `NetworkAclsValidationFailure`, "Only resources in eastus,
+westus, westus3 can be ACL-ed to virtual networks in eastus").
 
-- **East US, West US, West US 3** (`LUCIDITY_SUBNET_REGIONS`): traffic from
-  the subnet goes over the service endpoint with a private source address,
-  so only the **subnet rule** lets it in. Azure IP rules don't apply to this
-  traffic. The script still adds the IP rule: it has no effect while the
-  endpoint is in place, costs nothing, and covers traffic that doesn't take
-  the endpoint.
-- **Every other region:** traffic leaves through the public outbound IP, so
-  only the **IP rule** works. Azure rejects the subnet rule, whatever the
-  public access setting (retested 2026-10-29 on UK South accounts with
-  public access disabled and with selected networks:
-  `NetworkAclsValidationFailure`,
-  "Microsoft.Storage resources in uksouth cannot be ACL-ed to virtual
-  network … in eastus. Only resources in eastus, westus, westus3 can be
-  ACL-ed to virtual networks in eastus").
+**Moving existing customers over:** the IP is now in
+`LUCIDITY_RETIRED_EGRESS_IPS`, so a rerun (`--network-check-only` is
+enough) adds the subnet rule and then removes the IP rule, account by
+account. If adding the subnet rule fails, the IP rule is left in place.
+Customers who don't rerun keep both rules: the IP rule then has no effect
+for traffic over the endpoint, so whether those accounts stay reachable
+depends on their existing subnet rule (only accounts in the three regions
+above have one).
 
-The rejection is tested. Which rule actually carries the traffic in each
-region is from Azure's documented behaviour, not tested: that needs blob
-reads from a pod in `aks-subnet` against accounts with one rule each (East
-US and West US 3 with the subnet rule only and with the IP rule only, UK
-South with the IP rule only, and East US with public access disabled and a
-subnet rule). The script adds both rules where it can, so its result doesn't
-depend on which one it is.
+Tested 2026-10-30: Azure accepted the subnet rule on a UK South account
+(`state` `Succeeded`), and a `--network-check-only` rerun removed the old IP
+rule. Not tested: blob reads from `aks-subnet` through the Global endpoint,
+in particular to an account outside East US, West US and West US 3 with only
+the subnet rule.
 
 ## Network details
 
 The *Lucidity network details* block at the top of the script holds values
 that change on Lucidity's side:
 
-- **Outbound IP changes:** put the new IP in `LUCIDITY_EGRESS_IPS`, move the
-  old one to `LUCIDITY_RETIRED_EGRESS_IPS`, and update
-  `LUCIDITY_EGRESS_IPS_VALID_UNTIL`. A customer rerun then adds the new rule
-  and removes the old one. After the valid-until date, runs warn that the IP
-  may be outdated. Customers who downloaded the script earlier need the new
-  version.
-- **Service endpoint:** Lucidity's subnet (`LUCIDITY_SUBNET_IDS`) has a
-  Regional `Microsoft.Storage` service endpoint. With Lucidity's
-  load-balancer outbound, accounts in the regions the endpoint covers see the
-  subnet, and accounts elsewhere see the public IP. Azure rejects a subnet
-  rule on an account outside those regions (tested: "Only resources in
-  eastus, westus, westus3 can be ACL-ed to virtual networks in eastus").
-  `LUCIDITY_SUBNET_REGIONS` lists the covered regions: accounts there get
-  both rules, accounts elsewhere get the IP rule only. If Azure changes the
-  covered regions, update that list.
-- **Global service endpoint goes live:** every region then sees the subnet,
-  and IP rules stop working. Set `LUCIDITY_SUBNET_REGIONS="*"`, set
-  `LUCIDITY_EGRESS_IPS=""` and move its IPs to
-  `LUCIDITY_RETIRED_EGRESS_IPS`. A customer rerun then adds the subnet rule
-  everywhere and removes the IP rules. No code change is needed. Adding the
-  subnet rule outside the covered regions ahead of time isn't possible:
-  Azure rejects it until the Global endpoint is in place.
+- **Subnet:** `LUCIDITY_SUBNET_IDS`, with `LUCIDITY_SUBNET_REGIONS="*"`
+  (every region, as the endpoint is Global). If Lucidity moves to another
+  subnet, put the new ID in `LUCIDITY_SUBNET_IDS` and the old one in
+  `LUCIDITY_RETIRED_SUBNET_IDS`: a rerun adds the new rule and then removes
+  the old one.
+- **Outbound IPs:** `LUCIDITY_EGRESS_IPS` is empty, so no IP rules are
+  added. `LUCIDITY_RETIRED_EGRESS_IPS` holds the IP that earlier versions
+  added, so a rerun removes it. If IP rules are ever needed again, put the
+  IPs in `LUCIDITY_EGRESS_IPS` and their expected change date in
+  `LUCIDITY_EGRESS_IPS_VALID_UNTIL`; after that date runs warn that the IP
+  may be outdated.
+- Customers who downloaded the script earlier need the new version to pick
+  up any of these changes.
 
 ## Open items
 
-As of 2026-10-29.
+As of 2026-10-30.
 
-**Scheduled changes**
-- Lucidity's outbound IP changes around 2026-11-16: update
-  `LUCIDITY_EGRESS_IPS`, move the old IP to `LUCIDITY_RETIRED_EGRESS_IPS`,
-  and update `LUCIDITY_EGRESS_IPS_VALID_UNTIL`.
-- Global service endpoint: switch over as described above.
+**Pointers**
+- Lucidity's outbound IP `4.157.111.90` may change around 2026-11-16. The
+  script no longer adds IP rules, so this matters only if they come back
+  (see [Network details](#network-details)).
+- The sales team needs the 2026-10-30 script so customers move to the
+  subnet rule.
 
 **Not yet tested in real Azure** (see the test log in
 [testing-guide.md](testing-guide.md))
@@ -192,8 +184,10 @@ As of 2026-10-29.
 - Subnet rules for a customer storage account in a **different tenant**
   from Lucidity's subnet. Tested only within one tenant, on an East US
   account.
-- The region-aware subnet rules on real accounts in covered regions other
-  than East US (West US, West US 3).
+- Blob reads from `aks-subnet` through the Global endpoint, in particular to
+  an account outside East US, West US and West US 3 with only the subnet
+  rule. The rule itself is tested: on 2026-10-30 Azure accepted it on a UK
+  South account, and a rerun removed the old IP rule.
 - Creating Lucidity's service principal from its real application. Tested
   with a test app in the same tenant; Lucidity's multi-tenant app in a
   customer tenant is untested.
