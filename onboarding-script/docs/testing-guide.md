@@ -180,23 +180,21 @@ Expected:
   ```
      Firewall:
      - nothing needed: 1 (open to all networks, already allowing Lucidity, or file shares only)
-     - need Lucidity's rules: 2 (IP rule: 2, subnet rule: 1)
+     - need Lucidity's rules added or updated: 2 (subnet rule: 2)
      - need manual action: 1 (public access disabled: 1)
-     Subnet rules go only on accounts in eastus, westus, westus3.
-     Azure rejects them in other regions, so those accounts get the IP rule only.
      Each account's details are in the report.
   ```
 - Prompt `Apply these changes on 2 storage account(s)?`: answer `y`. An
   "Updating storage account N of 2..." line, then "Applied on 2, failed on
-  0." A failure means a rule didn't work: record Azure's error from the
+  0." A failure on `luctuk…` (UK South) with `ResourceBeingAcledHasWrongLocation`
+  means the subnet's endpoint isn't Global: record Azure's error from the
   report.
 - "Storage accounts that need attention: 1", with the public access
   disabled note.
 - Final status: `completed_with_warnings` (`luctoff…`, and Reservations
   Reader if it failed).
 - In the report, `storage.accounts`: `luctopen…` `open`, `lucteast…` and
-  `luctuk…` `applied` (`luctuk…` with `ipOnly: true`), `luctoff…`
-  `public_access_disabled`.
+  `luctuk…` `applied`, `luctoff…` `public_access_disabled`.
 
 Then check the rules (both accounts):
 
@@ -207,8 +205,8 @@ for a in luctuk$SFX lucteast$SFX; do
 done
 ```
 
-Expected: `lucteast…` has the IP `4.157.111.90` and Lucidity's subnet with
-state `Succeeded`; `luctuk…` has the IP and **no** subnet rule.
+Expected: both have Lucidity's subnet with state `Succeeded`, and **no** IP
+rule.
 
 Rerun the same command: "nothing needed: 3", no storage account needing
 attention beyond `luctoff…`, and **no** storage prompt.
@@ -627,11 +625,13 @@ onboarded.
 ### M. Network check only
 
 For a customer whose roles are in place and who only needs the firewall
-rules. Remove Lucidity's IP rule from one account first, so there is
-something to add:
+rules, here one onboarded by an earlier version: it has the old IP rule and
+no subnet rule. Set that up on one account:
 
 ```bash
-az storage account network-rule remove -g $RG --account-name luctuk$SFX --ip-address 4.157.111.90 -o none
+SUBNET_ID=$(grep '^LUCIDITY_SUBNET_IDS=' lucidity-onboarding.sh | cut -d'"' -f2)
+az storage account network-rule remove -g $RG --account-name luctuk$SFX --subnet "$SUBNET_ID" -o none
+az storage account network-rule add -g $RG --account-name luctuk$SFX --ip-address 4.157.111.90 -o none
 run --network-check-only      # answer y
 ```
 
@@ -640,8 +640,10 @@ Expected:
   check only: no roles are granted …", and no optimization prompt.
 - No "Resolving Lucidity's service principal", Reservations Reader or role
   steps.
-- "need Lucidity's rules: 1 (IP rule: 1, subnet rule: 0)", the prompt
-  `Apply these changes on 1 storage account(s)?`, then "Applied on 1".
+- "need Lucidity's rules added or updated: 1 (subnet rule: 1, old Lucidity
+  IP removed: 1)", the prompt `Apply these changes on 1 storage account(s)?`,
+  then "Applied on 1". `luctuk…` then has the subnet rule and no IP rule
+  (check with the `network-rule list` loop in A).
 - No blob setup section, even if earlier runs used `--blob-setup script`.
 - In the report, `"mode": "network-check-only"` and an empty
   `servicePrincipalObjectId`.
