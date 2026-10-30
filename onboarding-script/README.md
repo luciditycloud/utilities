@@ -171,9 +171,7 @@ account needs depends on its public network access setting:
 
 Lucidity's traffic arrives through its subnet's service endpoint, which
 reaches storage accounts in every region, so the subnet rule is all it
-needs. Earlier versions of this script also added an IP rule for Lucidity's
-outbound IP (`4.157.111.90`); a rerun adds the subnet rule and then removes
-that IP rule.
+needs.
 
 The script checks every storage account in the onboarded subscriptions,
 shows how many need changes, and asks once before making them. The report
@@ -200,6 +198,22 @@ own rules. Changes are made with your credentials.
 
 Storage account problems never fail the onboarding: the roles are already in
 place by then. The run finishes as `completed_with_warnings` instead.
+
+### If you ran an earlier version
+
+The version is printed at the start of every run and recorded in the report.
+Versions up to `2026-10-29` added the subnet rule only on storage accounts in
+East US, West US and West US 3, and an IP rule (`4.157.111.90`) on the
+others. Version `2026-10-30` uses the subnet rule everywhere, so **if you
+onboarded with an earlier version, rerun the script** to move your storage
+accounts over:
+
+```bash
+bash lucidity-onboarding.sh --scope-ids="<mg-id-1>,<mg-id-2>" --network-check-only
+```
+
+For each account it adds the subnet rule, and only then removes the old IP
+rule. Roles aren't touched.
 
 ## The report
 
