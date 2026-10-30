@@ -90,10 +90,11 @@ LUCIDITY_EGRESS_IPS=""
 LUCIDITY_EGRESS_IPS_VALID_UNTIL=""
 LUCIDITY_RETIRED_EGRESS_IPS="4.157.111.90"
 
-# Lucidity's AKS subnet. It has a Global Microsoft.Storage service endpoint
-# (Microsoft.Storage.Global), so Azure accepts its subnet rule on storage
-# accounts in every region ("*"). With a Regional endpoint, Azure rejects the
-# rule outside the endpoint's regions: list those regions here instead.
+# Lucidity's AKS subnet. It has the Microsoft.Storage.Global service endpoint
+# (the Global one; the Regional one is Microsoft.Storage), so Azure accepts
+# its subnet rule on storage accounts in every region ("*"). With a Regional
+# endpoint, Azure rejects the rule outside the endpoint's regions: list those
+# regions here instead.
 LUCIDITY_SUBNET_IDS="/subscriptions/3511ac94-c2ef-4644-8147-55f5f9a27a9e/resourceGroups/azurepls-rg/providers/Microsoft.Network/virtualNetworks/azurepls-vnet/subnets/aks-subnet"
 LUCIDITY_SUBNET_REGIONS="*"
 # Subnets Lucidity no longer uses; a rerun removes their rules.

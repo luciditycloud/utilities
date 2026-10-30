@@ -93,8 +93,8 @@ It can't be combined with `--mode`, `--feature-modules`, `--blob-setup` or
 ## How Lucidity's traffic reaches a storage account
 
 Lucidity's backend runs in `aks-subnet` (`LUCIDITY_SUBNET_IDS`), which has a
-**Global** `Microsoft.Storage` service endpoint (`Microsoft.Storage.Global`)
-since 2026-10-30. Traffic to storage accounts in every region goes over the
+`Microsoft.Storage.Global` service endpoint (the Global one; the Regional
+one is `Microsoft.Storage`) since 2026-10-30. Traffic to storage accounts in every region goes over the
 endpoint, with a private source address, so the subnet rule is what lets it
 in. Azure IP rules don't apply to this traffic.
 

@@ -218,7 +218,7 @@ script does (confirmed 2026-10-24). So this tests a cross-subscription
 rule, not a cross-tenant one. To test cross-tenant, use a test tenant
 different from the one that owns `LUCIDITY_SUBNET_IDS`, or point
 `LUCIDITY_SUBNET_IDS` at a subnet in another tenant that has a
-`Microsoft.Storage` service endpoint.
+`Microsoft.Storage.Global` service endpoint.
 
 ### B. Optimization mode, declined
 
