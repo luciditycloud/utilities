@@ -122,8 +122,10 @@ for traffic over the endpoint, so whether those accounts stay reachable
 depends on their existing subnet rule (only accounts in the three regions
 above have one).
 
-Not tested: blob reads from `aks-subnet` through the Global endpoint, in
-particular to an account outside East US, West US and West US 3 with only
+Tested 2026-10-30: Azure accepted the subnet rule on a UK South account
+(`state` `Succeeded`), and a `--network-check-only` rerun removed the old IP
+rule. Not tested: blob reads from `aks-subnet` through the Global endpoint,
+in particular to an account outside East US, West US and West US 3 with only
 the subnet rule.
 
 ## Network details
@@ -182,9 +184,10 @@ As of 2026-10-30.
 - Subnet rules for a customer storage account in a **different tenant**
   from Lucidity's subnet. Tested only within one tenant, on an East US
   account.
-- The Global service endpoint switch: adding the subnet rule outside East
-  US, West US and West US 3, removing the old IP rule on a rerun, and blob
-  reads through the endpoint.
+- Blob reads from `aks-subnet` through the Global endpoint, in particular to
+  an account outside East US, West US and West US 3 with only the subnet
+  rule. The rule itself is tested: on 2026-10-30 Azure accepted it on a UK
+  South account, and a rerun removed the old IP rule.
 - Creating Lucidity's service principal from its real application. Tested
   with a test app in the same tenant; Lucidity's multi-tenant app in a
   customer tenant is untested.
