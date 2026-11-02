@@ -227,7 +227,7 @@ run       # answer n
 ```
 
 Expected: the approval banner says "1 subscription(s)" and lists
-"autoscaler, blobs"; after `n`, a red "not approved. Nothing was changed."
+"autoscaler, idle disk, disk tiering, blobs"; after `n`, a red "not approved. Nothing was changed."
 with "Approve at the prompt, or rerun with --mode visibility.", and status
 `failed` with `[failed] Optimization mode approval`. No role was changed,
 and the run didn't get as far as resolving the service principal.
@@ -752,7 +752,8 @@ az account management-group delete --name $MG
 
 Record each real-Azure test run here. Runs before 2026-10-28 edited the
 settings in the file. Runs on 2026-10-28 used `--features`, and
-`subscription` was the default scope type. The scenarios are otherwise the
+`subscription` was the default scope type. Runs before 2026-11-02 granted
+only `autoscaler,blobs` by default in optimization mode. The scenarios are otherwise the
 same.
 
 | Date | Script commit | Tester | Scenarios | Result |

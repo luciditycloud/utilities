@@ -4,7 +4,7 @@ set -euo pipefail
 # Lucidity's Azure onboarding script. Run it with options instead of editing
 # this file; bash lucidity-onboarding.sh --help lists them. The settings below
 # are the defaults, and options override them.
-SCRIPT_VERSION="2026-10-30"
+SCRIPT_VERSION="2026-11-02"
 
 # ---------- Defaults ----------
 # Access scope: where Lucidity gets access.
@@ -31,11 +31,11 @@ EXCLUDE_IDS=""                  # -x, --exclude-ids, comma- or space-separated
 #                 Lucidity needs to project your savings.
 MODE="optimization"         # -m, --mode
 
-# Feature modules (optimization mode only; ignored in visibility).
-# --feature-modules replaces these with the modules it lists.
+# Feature modules (optimization mode only; ignored in visibility). All by
+# default; --feature-modules picks the ones it lists instead.
 AUTOSCALER=true
-IDLE_DISK=false
-DISK_TIERING=false
+IDLE_DISK=true
+DISK_TIERING=true
 BLOBS=true
 
 # Visibility data (both modes).
@@ -139,7 +139,7 @@ Permission scope (what Lucidity can do):
   -m, --mode MODE            optimization (default) or visibility
   -f, --feature-modules LIST Optimization mode only: autoscaler, blobs,
                              idle-disk, disk-tiering, comma-separated.
-                             Default: autoscaler,blobs
+                             Default: all
 
 Example:
   bash lucidity-onboarding.sh --scope-ids="<mg-id-1>,<mg-id-2>" --mode=visibility

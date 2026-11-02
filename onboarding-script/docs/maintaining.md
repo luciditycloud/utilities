@@ -149,7 +149,7 @@ that change on Lucidity's side:
 
 ## Open items
 
-As of 2026-10-30.
+As of 2026-11-02.
 
 **Pointers**
 - Lucidity's outbound IP `4.157.111.90` may change around 2026-11-16. The
@@ -160,6 +160,8 @@ As of 2026-10-30.
 
 **Not yet tested in real Azure** (see the test log in
 [testing-guide.md](testing-guide.md))
+- All feature modules by default in optimization mode (2026-11-02): not
+  yet run in real Azure (scenario B shows the module list).
 - Changes of 2026-10-29, tested only against a simulated Azure CLI: short
   options, `--feature-modules`, the `management-group` default,
   `--network-check-only`, and the count-based storage output.

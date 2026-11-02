@@ -83,7 +83,7 @@ IDs are comma-separated, for example `--exclude-ids="<id-1>,<id-2>"`.
 | Option | Default | What it does |
 |---|---|---|
 | `-m`, `--mode` | `optimization` | **`optimization`:** read access, plus write and delete permissions so Lucidity can act on its recommendations. You approve this at a prompt. **`visibility`:** read access, plus the data collection Lucidity needs to project your savings. No write or delete permissions on your resources |
-| `-f`, `--feature-modules` | `autoscaler,blobs` | Optimization mode only: which feature modules get write and delete permissions. Any of `autoscaler`, `blobs`, `idle-disk`, `disk-tiering`, comma-separated |
+| `-f`, `--feature-modules` | all | Optimization mode only: pick the feature modules that get write and delete permissions. Any of `autoscaler`, `blobs`, `idle-disk`, `disk-tiering`, comma-separated |
 
 See [What it grants](#what-it-grants) for the details.
 
@@ -204,7 +204,7 @@ place by then. The run finishes as `completed_with_warnings` instead.
 The version is printed at the start of every run and recorded in the report.
 Versions up to `2026-10-29` added the subnet rule only on storage accounts in
 East US, West US and West US 3, and an IP rule (`4.157.111.90`) on the
-others. Version `2026-10-30` uses the subnet rule everywhere, so **if you
+others. Versions from `2026-10-30` use the subnet rule everywhere, so **if you
 onboarded with an earlier version, rerun the script** to move your storage
 accounts over:
 
