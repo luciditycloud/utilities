@@ -4,7 +4,7 @@ set -euo pipefail
 # Lucidity's Azure onboarding script. Run it with options instead of editing
 # this file; bash lucidity-onboarding.sh --help lists them. The settings below
 # are the defaults, and options override them.
-SCRIPT_VERSION="2026-11-02"
+SCRIPT_VERSION="2026-11-11"
 
 # ---------- Defaults ----------
 # Access scope: where Lucidity gets access.
@@ -43,16 +43,18 @@ GUEST_INSIGHTS=true    # VM Run Command, so Lucidity can collect data inside VMs
 BLOB_VISIBILITY=true   # blob inventory, read only in the lucidity-inventory container
 
 # Who sets up blob visibility on each storage account: the lucidity-inventory
-# container and last access time tracking (used when BLOB_VISIBILITY is on).
-#   lucidity  Lucidity does it, so its role gets container and blob service
-#             write permissions.
+# container, last access time tracking and Lucidity's blob inventory rule
+# (used when BLOB_VISIBILITY is on).
+#   lucidity  Lucidity does it, so its role gets container, blob service and
+#             inventory policy write permissions.
 #   script    This script does it now, with your credentials, and Lucidity's
-#             role doesn't get those two permissions. Storage accounts created
+#             role doesn't get those permissions. Storage accounts created
 #             later need a rerun.
 BLOB_SETUP="lucidity"  # --blob-setup
 
 # Storage changes: firewall rules (used when BLOBS or BLOB_VISIBILITY is on)
-# and, with BLOB_SETUP=script, the container and last access time tracking.
+# and, with BLOB_SETUP=script, the container, last access time tracking and
+# inventory rule.
 # The script lists what each storage account needs and makes the changes only
 # after you approve them at the prompt.
 STORAGE_NETWORK_CHECK=true
@@ -158,8 +160,9 @@ Other options:
   --network-check-only       Only check storage account firewalls and add
                              Lucidity's rules. Grants no roles.
   --blob-setup WHO           lucidity (default) or script: who creates the
-                             lucidity-inventory container and turns on last
-                             access time tracking
+                             lucidity-inventory container, turns on last
+                             access time tracking and adds Lucidity's blob
+                             inventory rule
   --no-guest-insights        Don't grant VM Run Command
   -h, --help                 Show this help
 EOF
@@ -329,6 +332,56 @@ RETRY_DELAY=10
 INVENTORY_CONTAINER="lucidity-inventory"
 BLOB_READ="Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"
 BLOB_READ_CONDITION="((!(ActionMatches{'$BLOB_READ'})) OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEqualsIgnoreCase '$INVENTORY_CONTAINER'))"
+
+# Lucidity's blob inventory rule, added by this script with BLOB_SETUP=script.
+# It must match the rule Lucidity's backend creates (InventoryPolicyDefaults).
+# The reports list blob names and these properties, never blob contents.
+INVENTORY_RULE_NAME="lucidity-blob-inventory-policy"
+INVENTORY_RULE=$(cat <<EOF
+{
+  "enabled": true,
+  "name": "$INVENTORY_RULE_NAME",
+  "destination": "$INVENTORY_CONTAINER",
+  "definition": {
+    "format": "Parquet",
+    "schedule": "Weekly",
+    "objectType": "Blob",
+    "schemaFields": [
+      "Name", "Creation-Time", "Last-Modified", "ETag",
+      "Content-Length", "Content-Type", "Content-Encoding",
+      "Content-Language", "Content-CRC64", "Content-MD5",
+      "Cache-Control", "Content-Disposition", "BlobType",
+      "AccessTier", "AccessTierChangeTime", "AccessTierInferred",
+      "Metadata", "LastAccessTime", "LeaseStatus", "LeaseState",
+      "LeaseDuration", "ServerEncrypted", "CustomerProvidedKeySha256",
+      "RehydratePriority", "ArchiveStatus", "EncryptionScope",
+      "CopyId", "CopyStatus", "CopySource", "CopyProgress",
+      "CopyCompletionTime", "CopyStatusDescription",
+      "ImmutabilityPolicyUntilDate", "ImmutabilityPolicyMode",
+      "LegalHold", "Tags", "TagCount"
+    ],
+    "filters": {
+      "blobTypes": ["blockBlob", "appendBlob", "pageBlob"],
+      "includeSnapshots": false,
+      "includeBlobVersions": false,
+      "includeDeleted": false,
+      "excludePrefix": ["$INVENTORY_CONTAINER"]
+    }
+  }
+}
+EOF
+)
+
+# The rule for one storage account: accounts with hierarchical namespace
+# (Data Lake Storage) have no page blobs or blob index tags.
+inventory_rule() {
+  if [[ "$1" == hns ]]; then
+    jq -c '.definition.filters.blobTypes -= ["pageBlob"]
+      | .definition.schemaFields -= ["Tags", "TagCount"]' <<< "$INVENTORY_RULE"
+  else
+    jq -c . <<< "$INVENTORY_RULE"
+  fi
+}
 
 # ---------- Run report ----------
 # Every run, including a failed one, writes a report for the customer to send
@@ -758,11 +811,11 @@ role_reads_blobs() {
   jq -e --arg r "$BLOB_READ" 'index($r) != null' "$WORK_DIR/role-$1.data" >/dev/null
 }
 
-# The two permissions Lucidity needs only when it sets up blob visibility
-# itself (BLOB_SETUP=lucidity).
-BLOB_SETUP_ACTIONS='["Microsoft.Storage/storageAccounts/blobServices/write","Microsoft.Storage/storageAccounts/blobServices/containers/write"]'
+# The permissions Lucidity needs only when it sets up blob visibility itself
+# (BLOB_SETUP=lucidity).
+BLOB_SETUP_ACTIONS='["Microsoft.Storage/storageAccounts/blobServices/write","Microsoft.Storage/storageAccounts/blobServices/containers/write","Microsoft.Storage/storageAccounts/inventoryPolicies/write","Microsoft.Storage/storageAccounts/inventoryPolicies/delete"]'
 
-# True if the role (already set up this run) has either of them.
+# True if the role (already set up this run) has any of them.
 role_has_blob_setup_actions() {
   jq -e --argjson s "$BLOB_SETUP_ACTIONS" 'any(.[]; . as $a | $s | index($a) != null)' \
     "$WORK_DIR/role-$1.actions" >/dev/null
@@ -827,12 +880,10 @@ EOF
 
     if [[ "$BLOB_VISIBILITY" == true ]]; then
       cat <<'EOF'
-Microsoft.Storage/storageAccounts/inventoryPolicies/write
 Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action
-Microsoft.Storage/storageAccounts/inventoryPolicies/delete
 EOF
-      # Container and last access time tracking, unless this script sets
-      # them up (BLOB_SETUP=script).
+      # Container, last access time tracking and inventory policy, unless
+      # this script sets them up (BLOB_SETUP=script).
       if [[ "$BLOB_SETUP" == lucidity ]]; then
         jq -r '.[]' <<< "$BLOB_SETUP_ACTIONS"
       fi
@@ -853,7 +904,7 @@ fi
 if [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == lucidity ]]; then
   GUEST_DESCRIPTION="$GUEST_DESCRIPTION Blob visibility: manages blob inventory policies, the inventory container and last-access tracking, and reads blob data."
 elif [[ "$BLOB_VISIBILITY" == true ]]; then
-  GUEST_DESCRIPTION="$GUEST_DESCRIPTION Blob visibility: manages blob inventory policies and reads blob data; the inventory container and last-access tracking are set up by the onboarding script."
+  GUEST_DESCRIPTION="$GUEST_DESCRIPTION Blob visibility: reads blob inventory reports; the inventory policy, container and last-access tracking are set up by the onboarding script."
 fi
 
 # ---------- Optimization selections ----------
@@ -1154,8 +1205,8 @@ elif [[ "$MODE" == optimization && ${#FEATURES[@]} -gt 0 ]]; then
   echo " resource locks and storage accounts. The full list is in this script," >&2
   echo " under 'Optimization selections'." >&2
   if [[ "$BLOB_SETUP" == script && "$BLOBS" == true ]]; then
-    echo " Blob optimization includes container and blob service write" >&2
-    echo " permissions, even with --blob-setup script." >&2
+    echo " Blob optimization includes container, blob service and inventory" >&2
+    echo " policy permissions, even with --blob-setup script." >&2
   fi
   [[ "$ALL_SUBSCRIPTIONS" == true ]] && echo " $SCOPE_NOTE" >&2
   echo " For read-only visibility instead, rerun with --mode visibility." >&2
@@ -1257,10 +1308,11 @@ onboard_subscription() {
         role_has_blob_setup_actions "$role_name"; then
       touch "$WORK_DIR/role-$role_name.noted"
       record_step "Blob setup permissions in $role_name" "ok" false \
-        "still has container and blob service write permissions from an earlier run; --blob-setup script does not remove them"
+        "still has blob setup permissions (container, blob service or inventory policy write) from an earlier run; --blob-setup script does not remove them"
       echo "" >&2
-      echo "${YELLOW}NOTE: $role_name still has container and blob service write" >&2
-      echo "  permissions from an earlier run. --blob-setup script does not remove them.${RESET}" >&2
+      echo "${YELLOW}NOTE: $role_name still has blob setup permissions (container, blob" >&2
+      echo "  service or inventory policy write) from an earlier run. --blob-setup script" >&2
+      echo "  does not remove them.${RESET}" >&2
     fi
   fi
 
@@ -1323,9 +1375,10 @@ fi
 # Only Lucidity's own rules are added or removed; defaultAction and
 # publicNetworkAccess are never changed.
 #
-# Blob setup (BLOB_SETUP=script): the lucidity-inventory container and last
-# access time tracking. These are management operations, so a storage
-# firewall doesn't block them.
+# Blob setup (BLOB_SETUP=script): the lucidity-inventory container, last
+# access time tracking and Lucidity's inventory rule. The rule is added to the
+# account's inventory policy, keeping its other rules. These are management
+# operations, so a storage firewall doesn't block them.
 #
 # Changes use your credentials, not Lucidity's.
 
@@ -1344,7 +1397,9 @@ storage_note() {
     not_found)
       echo "Not found in the target subscriptions. Check the names in STORAGE_ACCOUNTS." ;;
     check_failed)
-      echo "Couldn't check the container or last access time tracking; see the report." ;;
+      echo "Couldn't check the container, last access time tracking or inventory policy; see the report." ;;
+    policy_disabled)
+      echo "The blob inventory policy is turned off, so Lucidity's rule doesn't run. Turn the policy on." ;;
     pending_approval)
       echo "Changes not made. Rerun and approve them at the prompt." ;;
     failed)
@@ -1377,7 +1432,37 @@ apply_storage_action() {
       az storage account blob-service-properties update --subscription "$sub" \
         -g "$rg" -n "$name" --enable-last-access-tracking true \
         --only-show-errors 2>&1 >/dev/null </dev/null ;;
+    inventory_rule)
+      # Writing a policy replaces it, so the current one is read again and
+      # Lucidity's rule added to its other rules (value: hns or standard).
+      local current policy_file="$WORK_DIR/inventory-policy.json"
+      if ! current=$(read_inventory_policy "$sub" "$rg" "$name"); then
+        echo "$current"
+        return 1
+      fi
+      jq -n --argjson rule "$(inventory_rule "$value")" --argjson cur "$current" \
+        '($cur // {enabled: true, type: "Inventory", rules: []})
+         | .rules = ([.rules[]? | select(.name != $rule.name)] + [$rule])' > "$policy_file"
+      az storage account blob-inventory-policy create --subscription "$sub" \
+        -g "$rg" --account-name "$name" --policy "@$policy_file" \
+        --only-show-errors 2>&1 >/dev/null </dev/null ;;
   esac
+}
+
+# Prints a storage account's blob inventory policy as JSON, or null if it has
+# none. On any other error, prints Azure's error and returns 1.
+read_inventory_policy() {
+  local policy
+  if policy=$(az storage account blob-inventory-policy show --subscription "$1" \
+      -g "$2" --account-name "$3" --query policy -o json \
+      --only-show-errors 2>"$WORK_DIR/policy.err" </dev/null); then
+    echo "${policy:-null}"
+  elif grep -q "NotFound" "$WORK_DIR/policy.err"; then
+    echo null
+  else
+    tr '\n' ' ' < "$WORK_DIR/policy.err"
+    return 1
+  fi
 }
 
 check_storage() {
@@ -1385,7 +1470,7 @@ check_storage() {
   local accounts_file="$WORK_DIR/accounts.jsonl"
   local checked_file="$WORK_DIR/accounts-checked.jsonl"
   local listed plan pending apply=false sub record name rg
-  local op type value err failures attention total lat exists check_err
+  local op type value err failures attention total lat exists check_err policy
   local done_count=0 reason count
 
   [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == script &&
@@ -1406,7 +1491,7 @@ check_storage() {
   for sub in $(jq -r 'select(.status == "eligible") | .subscriptionId' "$TARGETS_FILE"); do
     if ! listed=$(az storage account list --subscription "$sub" \
         --query "[].{name: name, resourceGroup: resourceGroup, location: location, kind: kind,
-          publicNetworkAccess: publicNetworkAccess,
+          isHnsEnabled: isHnsEnabled, publicNetworkAccess: publicNetworkAccess,
           defaultAction: networkRuleSet.defaultAction,
           ipRules: networkRuleSet.ipRules[].ipAddressOrRange,
           vnetRules: networkRuleSet.virtualNetworkRules[].virtualNetworkResourceId}" \
@@ -1443,8 +1528,14 @@ check_storage() {
           --only-show-errors 2>"$WORK_DIR/err" </dev/null); then
         check_err="${check_err:+$check_err; }container: $(tr '\n' ' ' < "$WORK_DIR/err")"
       fi
+      if ! policy=$(read_inventory_policy "$sub" "$rg" "$name"); then
+        check_err="${check_err:+$check_err; }inventory policy: $policy"
+        policy=null
+      fi
       jq -c --arg lat "${lat:-}" --arg exists "${exists:-}" --arg err "$check_err" \
-        '. + {latEnabled: ($lat == "true"), containerExists: ($exists == "true")}
+        --argjson policy "$policy" \
+        '. + {latEnabled: ($lat == "true"), containerExists: ($exists == "true"),
+              inventoryPolicy: $policy}
          + (if $err != "" then {setupCheckError: $err} else {} end)' \
         <<< "$record" >> "$checked_file"
     else
@@ -1464,7 +1555,9 @@ check_storage() {
     --argjson network "$network" \
     --argjson setup "$setup" \
     --argjson kinds "$BLOB_SETUP_KINDS" \
-    --arg container "$INVENTORY_CONTAINER" '
+    --arg container "$INVENTORY_CONTAINER" \
+    --argjson ruleStandard "$(inventory_rule standard)" \
+    --argjson ruleHns "$(inventory_rule hns)" '
     def has_ip($a; $ip): ($a.ipRules // []) | any(. == $ip or . == ($ip + "/32"));
     def has_subnet($a; $s): ($a.vnetRules // []) | any(ascii_downcase == ($s | ascii_downcase));
     def ip_adds($a): [$ips[] | select(has_ip($a; .) | not) | {op: "add", type: "ip", value: .}];
@@ -1491,15 +1584,33 @@ check_storage() {
         (subnet_adds($a) + ip_adds($a) + ip_removals($a) + subnet_removals($a)) as $actions
         | {status: (if $actions == [] then "already_allowed" else "needs_rule" end), actions: $actions}
       end;
+    # A rule'"'"'s settings, in a form that ignores the order Azure returns them in.
+    def rule_key($r):
+      {enabled: ($r.enabled // false), destination: $r.destination,
+       format: $r.definition.format, schedule: $r.definition.schedule,
+       objectType: $r.definition.objectType,
+       fields: (($r.definition.schemaFields // []) | sort),
+       blobTypes: (($r.definition.filters.blobTypes // []) | sort),
+       snapshots: ($r.definition.filters.includeSnapshots // false),
+       versions: ($r.definition.filters.includeBlobVersions // false),
+       deleted: ($r.definition.filters.includeDeleted // false),
+       exclude: (($r.definition.filters.excludePrefix // []) | sort)};
+    def has_rule($a; $rule):
+      ($a.inventoryPolicy.rules // []) | any(.name == $rule.name and rule_key(.) == rule_key($rule));
     def setup_part($a):
       if ($setup | not) then {setupStatus: "not_requested", actions: []}
       elif (any($kinds[]; . == $a.kind) | not) then {setupStatus: "not_supported", actions: []}
       elif $a.setupCheckError then
         {setupStatus: "check_failed", actions: [], setupDetail: $a.setupCheckError}
       else
-        ([if $a.containerExists then empty else {op: "create", type: "container", value: $container} end]
-         + [if $a.latEnabled then empty else {op: "enable", type: "last_access_tracking", value: "true"} end]) as $s
-        | {setupStatus: (if $s == [] then "ready" else "needs_setup" end), actions: $s}
+        (if $a.isHnsEnabled then ["hns", $ruleHns] else ["standard", $ruleStandard] end) as [$variant, $rule]
+        | ([if $a.containerExists then empty else {op: "create", type: "container", value: $container} end]
+           + [if $a.latEnabled then empty else {op: "enable", type: "last_access_tracking", value: "true"} end]
+           + [if has_rule($a; $rule) then empty else {op: "add", type: "inventory_rule", value: $variant} end]) as $s
+        # A policy the customer turned off is left off; it is reported instead.
+        | {setupStatus: (if $a.inventoryPolicy.enabled == false then "policy_disabled"
+                         elif $s == [] then "ready" else "needs_setup" end),
+           actions: $s}
       end;
     def classify:
       . as $a
@@ -1561,7 +1672,10 @@ check_storage() {
       "   - ready: \(count(.setupStatus == "ready"))",
       "   - need setup: \(count(.setupStatus == "needs_setup"))"
         + " (create the \($c) container: \(count(any(.actions[]; .type == "container"))),"
-        + " enable last access time tracking: \(count(any(.actions[]; .type == "last_access_tracking"))))",
+        + " enable last access time tracking: \(count(any(.actions[]; .type == "last_access_tracking"))),"
+        + " add Lucidity'"'"'s inventory rule: \(count(any(.actions[]; .type == "inventory_rule"))))",
+      (if count(.setupStatus == "policy_disabled") > 0 then
+        "   - inventory policy turned off: \(count(.setupStatus == "policy_disabled"))" else empty end),
       (if count(.setupStatus == "not_supported") > 0 then
         "   - not supported (account kind): \(count(.setupStatus == "not_supported"))" else empty end),
       (if count(.setupStatus == "check_failed") > 0 then
@@ -1628,7 +1742,7 @@ check_storage() {
 
   attention=$(jq -sc '[.[] | select(
       (.status | IN("public_access_disabled", "network_perimeter", "not_found"))
-      or .setupStatus == "check_failed"
+      or (.setupStatus | IN("check_failed", "policy_disabled"))
       or (.result | IN("pending_approval", "failed")))]' "$STORAGE_FILE")
 
   if [[ "$(jq length <<< "$attention")" -eq 0 ]]; then
@@ -1645,7 +1759,7 @@ check_storage() {
   while IFS=$'\t' read -r count reason; do
     echo "   - $count: $(storage_note "$reason")"
   done < <(jq -r '[.[] | (.status | select(IN("public_access_disabled", "network_perimeter", "not_found"))),
-      (select(.setupStatus == "check_failed") | "check_failed"),
+      (.setupStatus | select(IN("check_failed", "policy_disabled"))),
       (.result | select(IN("pending_approval", "failed")))]
     | group_by(.) | .[] | [length, .[0]] | @tsv' <<< "$attention")
   printf '%s' "$RESET"

@@ -93,7 +93,7 @@ See [What it grants](#what-it-grants) for the details.
 |---|---|
 | `-y`, `--auto-approve` | Answer yes to every prompt, for runs without a terminal |
 | `--network-check-only` | Only check storage account firewalls and add Lucidity's rules, for when Lucidity's roles are already in place. Grants no roles. Can't be combined with `--mode`, `--feature-modules`, `--blob-setup` or `--no-guest-insights` |
-| `--blob-setup script` | The script sets up blob inventory on your storage accounts with your credentials, instead of giving Lucidity's role those permissions. Storage accounts created later need a rerun |
+| `--blob-setup script` | The script sets up blob inventory on your storage accounts with your credentials: the `lucidity-inventory` container, last access time tracking and Lucidity's inventory rule, added to any inventory policy the account already has. Lucidity's role then gets no write permissions for them. Storage accounts created later need a rerun |
 | `--no-guest-insights` | Don't grant VM Run Command |
 | `-h`, `--help` | Show all options |
 
@@ -134,7 +134,7 @@ Output is coloured in a terminal. Set `NO_COLOR=1` to turn colours off.
 |---|---|---|---|
 | **Reader** (built-in) | Read all resource configuration | ✅ | ✅ |
 | **Reservations Reader** (built-in), at `/providers/Microsoft.Capacity` | Read Azure reservations (optional, tenant-wide) | ✅ attempted | ✅ attempted |
-| `lucidity-guest-insights-role-<id>` | Run the Lucidity collector inside VMs and scale-set instances (Run Command); manage blob inventory policies, create the inventory container and turn on last access time tracking (unless `--blob-setup script`), and read blob data | ✅ | ✅ |
+| `lucidity-guest-insights-role-<id>` | Run the Lucidity collector inside VMs and scale-set instances (Run Command); manage blob inventory policies, create the inventory container and turn on last access time tracking (unless `--blob-setup script`), and read the blob inventory reports | ✅ | ✅ |
 | `lucidity-optimize-role-<id>` | Write and delete permissions for the selected `--feature-modules` | ❌ | ✅ |
 
 - **Where the roles live:** with subscriptions, each subscription gets its
