@@ -268,8 +268,3 @@ The report contains no secrets.
   permissions listed in [Before you run it](#before-you-run-it).
 - **Storage account reported `failed`**: often an Azure Policy blocking
   network rule changes. The report has Azure's error.
-
----
-
-Lucidity's team: see [maintaining.md](docs/maintaining.md) for testing and
-maintaining this script.
