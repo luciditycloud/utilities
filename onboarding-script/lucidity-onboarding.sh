@@ -1441,7 +1441,7 @@ apply_storage_action() {
         return 1
       fi
       jq -n --argjson rule "$(inventory_rule "$value")" --argjson cur "$current" \
-        '($cur // {enabled: true, type: "Inventory", rules: []})
+        '(($cur | del(..|nulls)) // {enabled: true, type: "Inventory", rules: []})
          | .rules = ([.rules[]? | select(.name != $rule.name)] + [$rule])' > "$policy_file"
       az storage account blob-inventory-policy create --subscription "$sub" \
         -g "$rg" --account-name "$name" --policy "@$policy_file" \
