@@ -68,6 +68,11 @@ AUTO_APPROVE=false
 # no service principal, no blob setup (--network-check-only).
 NETWORK_CHECK_ONLY=false
 
+# With --network-check-only: also enable public network access from selected
+# networks on accounts where public access is disabled, then add Lucidity's
+# subnet rule (--enable-public-access-from-selected-networks).
+ENABLE_PUBLIC_ACCESS=false
+
 # Lucidity's service principal in your tenant. Leave empty: the script finds
 # it from Lucidity's application ID, and creates it in your tenant if it isn't
 # there yet. Set it only if Lucidity gives you an object ID.
@@ -159,6 +164,14 @@ Other options:
                              list, optimization access and storage changes
   --network-check-only       Only check storage account firewalls and add
                              Lucidity's rules. Grants no roles.
+  --enable-public-access-from-selected-networks
+                             With --network-check-only: on accounts with
+                             public network access disabled, enable it from
+                             selected networks (default action Deny), then
+                             add Lucidity's subnet rule. Without this option
+                             you are asked at the prompt; with it, you
+                             consent up front. Rolled back per account if
+                             the rule can't be added.
   --blob-setup WHO           lucidity (default) or script: who creates the
                              lucidity-inventory container, turns on last
                              access time tracking and adds Lucidity's blob
@@ -205,12 +218,13 @@ while [[ $# -gt 0 ]]; do
 
   case "$opt" in
     --help) usage_full; exit 0 ;;
-    --auto-approve|--no-guest-insights|--network-check-only)
+    --auto-approve|--no-guest-insights|--network-check-only|--enable-public-access-from-selected-networks)
       [[ "$has_value" == true ]] && usage_error "$opt doesn't take a value."
       case "$opt" in
         --auto-approve) AUTO_APPROVE=true ;;
         --no-guest-insights) GUEST_INSIGHTS=false; PERMISSION_OPTIONS+=("$opt") ;;
         --network-check-only) NETWORK_CHECK_ONLY=true ;;
+        --enable-public-access-from-selected-networks) ENABLE_PUBLIC_ACCESS=true ;;
       esac
       continue ;;
     --scope-type|--scope-ids|--exclude-ids|--mode|--feature-modules|--blob-setup) ;;
@@ -275,7 +289,7 @@ case "$BLOB_SETUP" in
   *) usage_error "--blob-setup must be lucidity or script. Got: '$BLOB_SETUP'" ;;
 esac
 
-for setting in AUTO_APPROVE AUTOSCALER IDLE_DISK DISK_TIERING BLOBS \
+for setting in AUTO_APPROVE ENABLE_PUBLIC_ACCESS AUTOSCALER IDLE_DISK DISK_TIERING BLOBS \
     GUEST_INSIGHTS BLOB_VISIBILITY STORAGE_NETWORK_CHECK; do
   case "${!setting}" in
     true|false) ;;
@@ -290,6 +304,9 @@ read -ra EXCLUDE_ID_LIST <<< "$(tr ',' ' ' <<< "$EXCLUDE_IDS")"
 
 if [[ "$NETWORK_CHECK_ONLY" == true && ${#PERMISSION_OPTIONS[@]} -gt 0 ]]; then
   usage_error "--network-check-only grants no roles, so it can't be combined with ${PERMISSION_OPTIONS[0]}."
+fi
+if [[ "$ENABLE_PUBLIC_ACCESS" == true && "$NETWORK_CHECK_ONLY" != true ]]; then
+  usage_error "--enable-public-access-from-selected-networks only works with --network-check-only."
 fi
 if [[ "$NETWORK_CHECK_ONLY" == true && "$STORAGE_NETWORK_CHECK" != true ]]; then
   error "--network-check-only needs STORAGE_NETWORK_CHECK=true."
@@ -434,6 +451,7 @@ finish() {
     --argjson allSubscriptions "$ALL_SUBSCRIPTIONS" \
     --argjson autoApprove "$AUTO_APPROVE" \
     --argjson networkCheckOnly "$NETWORK_CHECK_ONLY" \
+    --argjson enablePublicAccess "$ENABLE_PUBLIC_ACCESS" \
     --arg mode "$MODE" \
     --arg reservationsReader "$RESERVATIONS_READER" \
     --argjson guestInsights "$GUEST_INSIGHTS" \
@@ -465,6 +483,7 @@ finish() {
       allSubscriptions: $allSubscriptions,
       mode: (if $networkCheckOnly then "network-check-only" else $mode end),
       autoApprove: $autoApprove,
+      enablePublicAccessFromSelectedNetworks: $enablePublicAccess,
       featureModules: {
         autoscaler: $autoscaler,
         idleDisk: $idleDisk,
