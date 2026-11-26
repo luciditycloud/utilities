@@ -17,6 +17,9 @@ SCRIPT_VERSION="2026-11-11"
 #   subscription      SCOPE_IDS are subscription IDs. Each gets its own roles.
 #                     Empty SCOPE_IDS means every enabled subscription you can
 #                     access in this tenant, after you confirm the list.
+#   storage-account   SCOPE_IDS are storage account resource IDs. Only with
+#                     --network-check-only: only those accounts' firewalls are
+#                     checked. No roles are granted, and EXCLUDE_IDS isn't used.
 # EXCLUDE_IDS leaves out subscriptions, or with management groups also nested
 # management groups (everything under them).
 SCOPE_TYPE="management-group"   # -t, --scope-type
@@ -134,11 +137,16 @@ usage() {
 Usage: lucidity-onboarding.sh [options]
 
 Access scope (where Lucidity gets access):
-  -t, --scope-type TYPE      management-group (default) or subscription
+  -t, --scope-type TYPE      management-group (default), subscription, or
+                             storage-account (only with --network-check-only)
   -s, --scope-ids IDS        Management group IDs, comma-separated.
                              With --scope-type subscription: subscription IDs
                              (optional; without it, every enabled subscription
                              you can access, after you confirm the list).
+                             With --scope-type storage-account: storage
+                             account resource IDs (required), as in
+                             /subscriptions/<id>/resourceGroups/<rg>/providers/
+                             Microsoft.Storage/storageAccounts/<name>
   -x, --exclude-ids IDS      Subscriptions or nested management groups to
                              leave out, comma-separated.
 
@@ -275,8 +283,8 @@ done
 
 SCOPE_TYPE=$(tr 'A-Z_' 'a-z-' <<< "$SCOPE_TYPE")
 case "$SCOPE_TYPE" in
-  management-group|subscription) ;;
-  *) usage_error "--scope-type must be management-group or subscription. Got: '$SCOPE_TYPE'" ;;
+  management-group|subscription|storage-account) ;;
+  *) usage_error "--scope-type must be management-group, subscription or storage-account. Got: '$SCOPE_TYPE'" ;;
 esac
 
 case "$MODE" in
@@ -307,6 +315,21 @@ if [[ "$NETWORK_CHECK_ONLY" == true && ${#PERMISSION_OPTIONS[@]} -gt 0 ]]; then
 fi
 if [[ "$ENABLE_PUBLIC_ACCESS" == true && "$NETWORK_CHECK_ONLY" != true ]]; then
   usage_error "--enable-public-access-from-selected-networks only works with --network-check-only."
+fi
+# Storage account scope: exact resource IDs, network check only.
+STORAGE_ACCOUNT_IDS=""
+if [[ "$SCOPE_TYPE" == storage-account ]]; then
+  [[ "$NETWORK_CHECK_ONLY" == true ]] ||
+    usage_error "--scope-type storage-account grants no roles, so it only works with --network-check-only."
+  [[ ${#SCOPE_ID_LIST[@]} -gt 0 ]] ||
+    usage_error "--scope-type storage-account needs --scope-ids with storage account resource IDs."
+  [[ ${#EXCLUDE_ID_LIST[@]} -eq 0 ]] ||
+    usage_error "--exclude-ids can't be used with --scope-type storage-account. List only the accounts you want."
+  for id in "${SCOPE_ID_LIST[@]}"; do
+    [[ "$id" =~ ^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/[Mm]icrosoft\.[Ss]torage/storageAccounts/[^/]+$ ]] ||
+      usage_error "not a storage account resource ID: '$id'. Expected /subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<name>"
+  done
+  STORAGE_ACCOUNT_IDS="${SCOPE_ID_LIST[*]}"
 fi
 if [[ "$NETWORK_CHECK_ONLY" == true && "$STORAGE_NETWORK_CHECK" != true ]]; then
   error "--network-check-only needs STORAGE_NETWORK_CHECK=true."
@@ -1083,6 +1106,12 @@ elif [[ "$SCOPE_TYPE" == subscription ]]; then
   for id in "${SCOPE_ID_LIST[@]}"; do
     add_target "$id" "$id" "$ALL_SUBS"
   done
+elif [[ "$SCOPE_TYPE" == storage-account ]]; then
+  # The accounts' subscriptions are the targets; only the named accounts are
+  # checked in them.
+  for id in $(printf '%s\n' "${SCOPE_ID_LIST[@]}" | cut -d/ -f3 | sort -fu); do
+    add_target "$id" "$id" "$ALL_SUBS"
+  done
 else
   if ! ENTITIES=$(az account management-group entities list -o json \
       --only-show-errors 2>"$WORK_DIR/err"); then
@@ -1160,7 +1189,7 @@ if [[ "$ALL_SUBSCRIPTIONS" == true && "$SCOPE_TYPE" == management-group ]]; then
 elif [[ "$ALL_SUBSCRIPTIONS" == true ]]; then
   progress "Targets: every subscription you can access in tenant $TENANT_ID"
 else
-  progress "Targets ($SCOPE_TYPE):"
+  progress "Targets ($SCOPE_TYPE$([[ "$SCOPE_TYPE" == storage-account ]] && echo ", shown as their subscriptions")):"
 fi
 jq -r --arg verb "$([[ "$NETWORK_CHECK_ONLY" == true ]] && echo check || echo onboard)" \
   '"   \(.subscriptionId)" + (if .name != "" then " (\(.name))" else "" end)
@@ -1414,7 +1443,7 @@ storage_note() {
     network_perimeter)
       echo "Secured by a network security perimeter. Add Lucidity to the perimeter's access rules." ;;
     not_found)
-      echo "Not found in the target subscriptions. Check the names in STORAGE_ACCOUNTS." ;;
+      echo "Not found, or your account can't read them. Check the names in STORAGE_ACCOUNTS or the resource IDs in --scope-ids." ;;
     check_failed)
       echo "Couldn't check the container, last access time tracking or inventory policy; see the report." ;;
     policy_disabled)
@@ -1509,7 +1538,7 @@ check_storage() {
   progress "Listing storage accounts in $(jq -s '[.[] | select(.status == "eligible")] | length' "$TARGETS_FILE") subscription(s)..."
   for sub in $(jq -r 'select(.status == "eligible") | .subscriptionId' "$TARGETS_FILE"); do
     if ! listed=$(az storage account list --subscription "$sub" \
-        --query "[].{name: name, resourceGroup: resourceGroup, location: location, kind: kind,
+        --query "[].{id: id, name: name, resourceGroup: resourceGroup, location: location, kind: kind,
           isHnsEnabled: isHnsEnabled, publicNetworkAccess: publicNetworkAccess,
           defaultAction: networkRuleSet.defaultAction,
           ipRules: networkRuleSet.ipRules[].ipAddressOrRange,
@@ -1519,8 +1548,13 @@ check_storage() {
         "could not list storage accounts: $(tr '\n' ' ' < "$WORK_DIR/storage-list.err")"
       continue
     fi
+    # With storage account IDs, only those accounts; otherwise the name
+    # filter, if any.
     jq -c --arg sub "$sub" --argjson wanted "$(to_json_list "$STORAGE_ACCOUNTS")" \
-      '.[] | select($wanted == [] or (.name as $n | any($wanted[]; . == $n)))
+      --argjson ids "$(to_json_list "$STORAGE_ACCOUNT_IDS")" \
+      '.[] | select(if ($ids | length) > 0
+                    then (.id | ascii_downcase) as $i | any($ids[]; ascii_downcase == $i)
+                    else ($wanted == [] or (.name as $n | any($wanted[]; . == $n))) end)
        | . + {subscriptionId: $sub}' <<< "$listed" >> "$accounts_file"
   done
   : > "$STORAGE_CHECKED_FILE"
@@ -1566,6 +1600,7 @@ check_storage() {
   # the changes it needs (actions).
   plan=$(jq -sc \
     --argjson wanted "$(to_json_list "$STORAGE_ACCOUNTS")" \
+    --argjson wantedIds "$(to_json_list "$STORAGE_ACCOUNT_IDS")" \
     --argjson ips "$(to_json_list "$LUCIDITY_EGRESS_IPS")" \
     --argjson retired "$(to_json_list "$LUCIDITY_RETIRED_EGRESS_IPS")" \
     --argjson subnets "$(to_json_list "$LUCIDITY_SUBNET_IDS")" \
@@ -1644,8 +1679,13 @@ check_storage() {
         + (if $s.setupDetail then {setupDetail: $s.setupDetail} else {} end);
     . as $all
     | [$all[] | classify]
-      + [$wanted[] | . as $w | select($all | all(.name != $w))
-         | {name: $w, status: "not_found", setupStatus: "not_found", actions: []}]' "$checked_file")
+      + (if ($wantedIds | length) > 0 then
+           [$wantedIds[] | . as $w | select($all | all((.id | ascii_downcase) != ($w | ascii_downcase)))
+            | {name: $w, status: "not_found", setupStatus: "not_found", actions: []}]
+         else
+           [$wanted[] | . as $w | select($all | all(.name != $w))
+            | {name: $w, status: "not_found", setupStatus: "not_found", actions: []}]
+         end)' "$checked_file")
 
   total=$(jq length <<< "$plan")
   pending=$(jq '[.[] | select(.actions != [])] | length' <<< "$plan")
