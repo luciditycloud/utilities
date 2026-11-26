@@ -4,7 +4,7 @@ set -euo pipefail
 # Lucidity's Azure onboarding script. Run it with options instead of editing
 # this file; bash lucidity-onboarding.sh --help lists them. The settings below
 # are the defaults, and options override them.
-SCRIPT_VERSION="2026-11-11"
+SCRIPT_VERSION="2026-11-26"
 
 # ---------- Defaults ----------
 # Access scope: where Lucidity gets access.
@@ -1419,8 +1419,12 @@ fi
 # traffic coming from that subnet, and the subnet rule is what allows it.
 # The IP rules of the earlier Regional setup are removed on a rerun.
 # With public network access disabled, only a private endpoint can reach an
-# account, so those are only reported.
-# Only Lucidity's own rules are added or removed; defaultAction and
+# account, so those are only reported, unless the customer consents (with
+# --network-check-only: --enable-public-access-from-selected-networks, or a
+# yes at its prompt). Then public access is enabled with default action Deny
+# in one call and the subnet rule added; if the rule can't be added, the
+# enable is rolled back.
+# Otherwise only Lucidity's own rules are added or removed; defaultAction and
 # publicNetworkAccess are never changed.
 #
 # Blob setup (BLOB_SETUP=script): the lucidity-inventory container, last
