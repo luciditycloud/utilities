@@ -1565,7 +1565,7 @@ check_storage() {
   local checked_file="$WORK_DIR/accounts-checked.jsonl"
   local listed plan pending apply=false sub record name rg
   local op type value err failures attention total lat exists check_err policy
-  local done_count=0 reason count enabled added result orig_default rb_err restore
+  local done_count=0 reason count enable_count enabled added result orig_default rb_err restore
 
   [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == script &&
      "$NETWORK_CHECK_ONLY" != true ]] && setup=true
@@ -1730,10 +1730,13 @@ check_storage() {
       . as $a
       | {subscriptionId, name, resourceGroup, location, kind,
          publicNetworkAccess: (.publicNetworkAccess // "Enabled"),
-         defaultAction: (.defaultAction // "Allow")} as $base
+         defaultAction: (.defaultAction // "Allow"),
+         ipRuleCount: ((.ipRules // []) | length),
+         vnetRuleCount: ((.vnetRules // []) | length)} as $base
       | network_part($a; $base) as $n
       | setup_part($a) as $s
       | $base + {status: $n.status, setupStatus: $s.setupStatus, actions: ($n.actions + $s.actions),
+                 enableEligible: ($n.enableEligible // false),
                  subnetRuleApplies: (($subnets | length) > 0 and subnet_covers($a)),
                  ipOnly: (($subnets | length) > 0 and ($ips | length) > 0 and (subnet_covers($a) | not))}
         + (if $s.setupDetail then {setupDetail: $s.setupDetail} else {} end);
@@ -1751,13 +1754,41 @@ check_storage() {
   total=$(jq length <<< "$plan")
   pending=$(jq '[.[] | select(.actions != [])] | length' <<< "$plan")
 
+  # Network-check-only runs: the accounts that need action or attention, one
+  # per row, so a long list can be filtered instead of read on the console.
+  # Written before any prompt, and again if consent changes the plan.
+  PLAN_FILE="${REPORT_FILE/lucidity-onboarding-report-/lucidity-storage-plan-}"
+  PLAN_FILE="${PLAN_FILE%.json}.csv"
+  write_plan_file() {
+    local rows
+    rows=$(jq '[.[] | select(.status | IN("needs_rule", "public_access_will_enable",
+        "public_access_disabled", "network_perimeter", "not_found"))] | length' <<< "$plan")
+    if [[ "$rows" -eq 0 ]]; then
+      rm -f "$PLAN_FILE"
+      return 0
+    fi
+    jq -r '
+      def action_text: if .type == "public_access"
+        then "enable public access from selected networks (default action Deny)"
+        else "\(.op) \(.type) rule \(.value | split("/") | last)" end;
+      ["subscription", "resource_group", "account", "region", "status", "planned_actions",
+       "public_network_access", "default_action", "ip_rules", "vnet_rules"],
+      (.[] | select(.status | IN("needs_rule", "public_access_will_enable",
+          "public_access_disabled", "network_perimeter", "not_found"))
+       | [.subscriptionId, .resourceGroup, .name, .location, .status,
+          ([.actions[] | action_text] | join("; ")),
+          .publicNetworkAccess, .defaultAction, .ipRuleCount, .vnetRuleCount])
+      | @csv' <<< "$plan" > "$PLAN_FILE" 2>/dev/null || PLAN_FILE=""
+  }
+  [[ "$NETWORK_CHECK_ONLY" == true ]] && write_plan_file
+
   # Counts only: per-account details are in the report.
   echo ""
   echo "${BOLD}>> Storage accounts: $total${RESET}"
   if [[ "$network" == true ]]; then
     jq -r '
       def count(f): [.[] | select(f)] | length;
-      def rules(t): count(any(.actions[]; .type == t and .op == "add"));
+      def rules(t): count(.status == "needs_rule" and any(.actions[]; .type == t and .op == "add"));
       "   Firewall:",
       "   - nothing needed: \(count(.status | IN("open", "already_allowed", "not_applicable")))"
         + " (open to all networks, already allowing Lucidity, or file shares only)",
@@ -1770,6 +1801,9 @@ check_storage() {
                          (removals("subnet") | select(. > 0) | "old Lucidity subnet removed: \(.)")]
                         | join(", ")) + ")"
            else "" end),
+      (if count(.status == "public_access_will_enable") > 0 then
+        "   - public access disabled, to be enabled from selected networks, then Lucidity'"'"'s subnet rule added: \(count(.status == "public_access_will_enable"))"
+       else empty end),
       (if count(.status | IN("public_access_disabled", "network_perimeter")) > 0 then
         "   - need manual action: \(count(.status | IN("public_access_disabled", "network_perimeter")))"
         + " (" + ([(count(.status == "public_access_disabled") | select(. > 0)
@@ -1802,7 +1836,40 @@ check_storage() {
         "   - couldn'"'"'t check: \(count(.setupStatus == "check_failed"))" else empty end)' \
       --arg c "$INVENTORY_CONTAINER" <<< "$plan"
   fi
+  if [[ "$NETWORK_CHECK_ONLY" == true && -n "$PLAN_FILE" && -f "$PLAN_FILE" ]]; then
+    echo "   Accounts that need action, one per row: $PLAN_FILE"
+    echo "   (filter the status column: needs_rule, public_access_will_enable,"
+    echo "   public_access_disabled, network_perimeter, not_found)"
+  fi
   echo "   Each account's details are in the report."
+
+  # Public access disabled: consent is the flag, or a yes to its own prompt.
+  # --auto-approve does not answer it. A no, or no terminal, leaves those
+  # accounts untouched.
+  if [[ "$NETWORK_CHECK_ONLY" == true && "$ENABLE_PUBLIC_ACCESS" != true ]]; then
+    count=$(jq '[.[] | select(.status == "public_access_disabled" and .enableEligible)] | length' <<< "$plan")
+    if [[ "$count" -gt 0 ]]; then
+      if has_terminal; then
+        echo ""
+        echo "${BOLD}$count storage account(s) have public network access disabled, so Lucidity can't reach them.${RESET}"
+        echo "   To include them, for each of these accounts the script will:"
+        echo "   1. Enable public network access from selected networks"
+        echo "      (public access Enabled, default action Deny)"
+        echo "   2. Add Lucidity's subnet rule"
+        echo "   If step 2 fails, step 1 is rolled back for that account."
+        echo "   Any IP or VNet rules the account already has become active again."
+        [[ -f "$PLAN_FILE" ]] && echo "   Review them first: filter status = public_access_disabled in $PLAN_FILE"
+        if ask_yes "Enable public access from selected networks and add Lucidity's rule on these $count account(s)?"; then
+          plan=$(build_plan true)
+          pending=$(jq '[.[] | select(.actions != [])] | length' <<< "$plan")
+          write_plan_file
+        fi
+      else
+        echo "   $count account(s) have public network access disabled and were not changed (no terminal to ask)."
+        echo "   To include them, add --enable-public-access-from-selected-networks."
+      fi
+    fi
+  fi
 
   # Unlike the approvals above, a no here doesn't stop the run: the roles
   # are already in place.
@@ -1811,7 +1878,8 @@ check_storage() {
       apply=true
       echo "   Auto-approved (--auto-approve)."
     elif has_terminal; then
-      ask_yes "Apply these changes on $pending storage account(s)?" && apply=true
+      enable_count=$(jq '[.[] | select(.status == "public_access_will_enable")] | length' <<< "$plan")
+      ask_yes "Apply these changes on $pending storage account(s)$([[ "$enable_count" -gt 0 ]] && echo ", including enabling public access on $enable_count")?" && apply=true
     else
       echo "   No terminal to ask for approval, so nothing was changed."
       echo "   Rerun in a terminal, or add --auto-approve."
