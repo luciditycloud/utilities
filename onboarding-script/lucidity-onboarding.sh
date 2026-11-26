@@ -1439,7 +1439,7 @@ BLOB_SETUP_KINDS='["StorageV2","BlobStorage","BlockBlobStorage"]'
 storage_note() {
   case "$1" in
     public_access_disabled)
-      echo "Public network access is disabled, so Lucidity can't reach them. To include them, allow selected networks and rerun." ;;
+      echo "Public network access is disabled, so Lucidity can't reach them. To include them, rerun with --network-check-only --enable-public-access-from-selected-networks, or allow selected networks yourself." ;;
     network_perimeter)
       echo "Secured by a network security perimeter. Add Lucidity to the perimeter's access rules." ;;
     not_found)
@@ -1452,6 +1452,10 @@ storage_note() {
       echo "Changes not made. Rerun and approve them at the prompt." ;;
     failed)
       echo "Some changes failed; see the report for the error." ;;
+    failed_rolled_back)
+      echo "Public access was enabled but Lucidity's rule couldn't be added, so public access was set back to Disabled. See the report for the error." ;;
+    failed_rollback_incomplete)
+      echo "ACTION NEEDED: public access was enabled, the rule couldn't be added, and public access couldn't be set back to Disabled. The report has each account's restoreCommand." ;;
   esac
 }
 
@@ -1466,6 +1470,12 @@ apply_storage_action() {
   local value="$6"
 
   case "$type" in
+    public_access)
+      # One call, so the account is never open to all networks: public
+      # access on, default action Deny.
+      az storage account update --subscription "$sub" -g "$rg" -n "$name" \
+        --public-network-access Enabled --default-action Deny \
+        --only-show-errors 2>&1 >/dev/null </dev/null ;;
     ip|subnet)
       local flag="--ip-address"
       [[ "$type" == subnet ]] && flag="--subnet"
@@ -1497,6 +1507,42 @@ apply_storage_action() {
   esac
 }
 
+# Puts an account back as it was before this run enabled public network access:
+# public access Disabled and its original default action, retried because
+# most failures here are transient (an account still updating). Then removes
+# the rules this run added. Prints Azure's error and returns 1 if the account
+# could not be restored.
+# Arguments: subscription, resource group, account, original default action,
+# then the rules this run added as "type value" strings.
+rollback_public_access() {
+  local sub="$1" rg="$2" name="$3" default_action="$4"
+  shift 4
+  local attempt err="" rule type value flag
+  for attempt in 1 2 3; do
+    if err=$(az storage account update --subscription "$sub" -g "$rg" -n "$name" \
+        --public-network-access Disabled --default-action "$default_action" \
+        --only-show-errors 2>&1 >/dev/null </dev/null); then
+      err=""
+      break
+    fi
+    [[ "$attempt" -lt 3 ]] && sleep $((attempt * 5))
+  done
+  if [[ -n "$err" ]]; then
+    echo "$err"
+    return 1
+  fi
+  # Best effort: with public access off, a leftover rule does nothing.
+  for rule in "$@"; do
+    type="${rule%% *}"
+    value="${rule#* }"
+    flag="--ip-address"
+    [[ "$type" == subnet ]] && flag="--subnet"
+    az storage account network-rule remove --subscription "$sub" -g "$rg" \
+      --account-name "$name" "$flag" "$value" --only-show-errors >/dev/null 2>&1 </dev/null || true
+  done
+  return 0
+}
+
 # Prints a storage account's blob inventory policy as JSON, or null if it has
 # none. On any other error, prints Azure's error and returns 1.
 read_inventory_policy() {
@@ -1519,7 +1565,7 @@ check_storage() {
   local checked_file="$WORK_DIR/accounts-checked.jsonl"
   local listed plan pending apply=false sub record name rg
   local op type value err failures attention total lat exists check_err policy
-  local done_count=0 reason count
+  local done_count=0 reason count enabled added result orig_default rb_err restore
 
   [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == script &&
      "$NETWORK_CHECK_ONLY" != true ]] && setup=true
@@ -1598,7 +1644,10 @@ check_storage() {
 
   # One entry per account: its firewall status, its blob setup status, and
   # the changes it needs (actions).
-  plan=$(jq -sc \
+  # $1: true to also plan enabling public network access from selected
+  # networks on accounts where it is disabled.
+  build_plan() { jq -sc \
+    --argjson allowEnable "$1" \
     --argjson wanted "$(to_json_list "$STORAGE_ACCOUNTS")" \
     --argjson wantedIds "$(to_json_list "$STORAGE_ACCOUNT_IDS")" \
     --argjson ips "$(to_json_list "$LUCIDITY_EGRESS_IPS")" \
@@ -1629,7 +1678,18 @@ check_storage() {
     def network_part($a; $base):
       if ($network | not) then {status: "not_checked", actions: []}
       elif $a.kind == "FileStorage" then {status: "not_applicable", actions: []}
-      elif $base.publicNetworkAccess == "Disabled" then {status: "public_access_disabled", actions: []}
+      elif $base.publicNetworkAccess == "Disabled" then
+        # Enabling public access from selected networks is only worth doing
+        # where the Lucidity subnet rule applies, and only with consent. The
+        # enable comes first, then the rules; the apply step rolls the enable
+        # back if a rule cannot be added.
+        if subnet_covers($a) and ($subnets | length) > 0 then
+          if $allowEnable then
+            ([{op: "enable", type: "public_access", value: "selected-networks"}]
+             + subnet_adds($a) + ip_adds($a)) as $actions
+            | {status: "public_access_will_enable", actions: $actions, enableEligible: true}
+          else {status: "public_access_disabled", actions: [], enableEligible: true} end
+        else {status: "public_access_disabled", actions: []} end
       elif $base.publicNetworkAccess == "SecuredByPerimeter" then {status: "network_perimeter", actions: []}
       elif $base.defaultAction == "Allow" then {status: "open", actions: []}
       else
@@ -1685,7 +1745,8 @@ check_storage() {
          else
            [$wanted[] | . as $w | select($all | all(.name != $w))
             | {name: $w, status: "not_found", setupStatus: "not_found", actions: []}]
-         end)' "$checked_file")
+         end)' "$checked_file"; }
+  plan=$(build_plan "$ENABLE_PUBLIC_ACCESS")
 
   total=$(jq length <<< "$plan")
   pending=$(jq '[.[] | select(.actions != [])] | length' <<< "$plan")
@@ -1774,35 +1835,72 @@ check_storage() {
     done_count=$((done_count + 1))
     [[ -t 2 ]] && printf '\r   Updating storage account %d of %d...' "$done_count" "$pending" >&2
     failures=""
-    # Removing an old rule after a new one failed could cut Lucidity off, so
-    # removals are skipped then.
+    enabled=false
+    added=()
+    result=""
+    # Enabling public access and adding the rule are one unit: if the enable
+    # worked and a rule can't be added, the enable is rolled back and the
+    # remaining changes for the account are not made. If the enable itself
+    # fails, nothing has changed and there is nothing to roll back.
+    # Otherwise, removing an old rule after a new one failed could cut
+    # Lucidity off, so removals are skipped then.
     while IFS=$'\t' read -r op type value; do
       if [[ "$op" == remove && -n "$failures" ]]; then
         failures="${failures}${op} ${type} ${value}: skipped, because an earlier change failed; "
         continue
       fi
-      if ! err=$(apply_storage_action "$sub" "$rg" "$name" "$op" "$type" "$value"); then
-        failures="${failures}${op} ${type} ${value}: ${err}; "
+      if err=$(apply_storage_action "$sub" "$rg" "$name" "$op" "$type" "$value"); then
+        [[ "$type" == public_access ]] && enabled=true
+        [[ "$op" == add && "$type" =~ ^(ip|subnet)$ ]] && added+=("$type $value")
+        continue
+      fi
+      failures="${failures}${op} ${type} ${value}: ${err}; "
+      if [[ "$type" == public_access ]]; then
+        result="failed"
+        break
+      fi
+      if [[ "$enabled" == true ]]; then
+        orig_default=$(jq -r '.defaultAction // "Allow"' <<< "$record")
+        if rb_err=$(rollback_public_access "$sub" "$rg" "$name" "$orig_default" \
+            ${added[@]+"${added[@]}"}); then
+          result="failed_rolled_back"
+          failures="${failures}public access was set back to Disabled (default action ${orig_default}); "
+        else
+          result="failed_rollback_incomplete"
+          failures="${failures}COULD NOT SET PUBLIC ACCESS BACK: ${rb_err}; "
+        fi
+        break
       fi
     done < <(jq -r '.actions[] | [.op, .type, .value] | @tsv' <<< "$record")
 
+    # To undo what this run did, whatever the result.
+    restore=""
+    if [[ "$enabled" == true && "$result" != failed_rolled_back ]]; then
+      restore="az storage account update --subscription $sub -g $rg -n $name --public-network-access Disabled --default-action $(jq -r '.defaultAction // "Allow"' <<< "$record")"
+    fi
+
     if [[ -z "$failures" ]]; then
-      jq -c '.result = "applied"' <<< "$record" >> "$STORAGE_FILE"
+      jq -c --arg restore "$restore" '.result = "applied"
+        | if $restore != "" then .restoreCommand = $restore else . end' \
+        <<< "$record" >> "$STORAGE_FILE"
     else
-      jq -c --arg detail "$failures" '.result = "failed" | .detail = $detail' \
+      jq -c --arg detail "$failures" --arg restore "$restore" \
+        --arg result "${result:-failed}" \
+        '.result = $result | .detail = $detail
+         | if $restore != "" then .restoreCommand = $restore else . end' \
         <<< "$record" >> "$STORAGE_FILE"
     fi
   done < <(jq -c '.[]' <<< "$plan")
   if [[ "$apply" == true ]]; then
     [[ -t 2 ]] && echo "" >&2
     echo "   Applied on $(jq -s '[.[] | select(.result == "applied")] | length' "$STORAGE_FILE")," \
-      "failed on $(jq -s '[.[] | select(.result == "failed")] | length' "$STORAGE_FILE")."
+      "failed on $(jq -s '[.[] | select((.result // "") | startswith("failed"))] | length' "$STORAGE_FILE")."
   fi
 
   attention=$(jq -sc '[.[] | select(
       (.status | IN("public_access_disabled", "network_perimeter", "not_found"))
       or (.setupStatus | IN("check_failed", "policy_disabled"))
-      or (.result | IN("pending_approval", "failed")))]' "$STORAGE_FILE")
+      or (.result | IN("pending_approval", "failed", "failed_rolled_back", "failed_rollback_incomplete")))]' "$STORAGE_FILE")
 
   if [[ "$(jq length <<< "$attention")" -eq 0 ]]; then
     record_step "Storage check" "ok" false \
@@ -1819,7 +1917,7 @@ check_storage() {
     echo "   - $count: $(storage_note "$reason")"
   done < <(jq -r '[.[] | (.status | select(IN("public_access_disabled", "network_perimeter", "not_found"))),
       (.setupStatus | select(IN("check_failed", "policy_disabled"))),
-      (.result | select(IN("pending_approval", "failed")))]
+      (.result | select(IN("pending_approval", "failed", "failed_rolled_back", "failed_rollback_incomplete")))]
     | group_by(.) | .[] | [length, .[0]] | @tsv' <<< "$attention")
   printf '%s' "$RESET"
 }
