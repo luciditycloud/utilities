@@ -4,7 +4,7 @@ set -euo pipefail
 # Lucidity's Azure onboarding script. Run it with options instead of editing
 # this file; bash lucidity-onboarding.sh --help lists them. The settings below
 # are the defaults, and options override them.
-SCRIPT_VERSION="2026-11-11"
+SCRIPT_VERSION="2026-11-26"
 
 # ---------- Defaults ----------
 # Access scope: where Lucidity gets access.
@@ -17,6 +17,9 @@ SCRIPT_VERSION="2026-11-11"
 #   subscription      SCOPE_IDS are subscription IDs. Each gets its own roles.
 #                     Empty SCOPE_IDS means every enabled subscription you can
 #                     access in this tenant, after you confirm the list.
+#   storage-account   SCOPE_IDS are storage account resource IDs. Only with
+#                     --network-check-only: only those accounts' firewalls are
+#                     checked. No roles are granted, and EXCLUDE_IDS isn't used.
 # EXCLUDE_IDS leaves out subscriptions, or with management groups also nested
 # management groups (everything under them).
 SCOPE_TYPE="management-group"   # -t, --scope-type
@@ -67,6 +70,11 @@ AUTO_APPROVE=false
 # Only check storage account firewalls and add Lucidity's rules: no roles,
 # no service principal, no blob setup (--network-check-only).
 NETWORK_CHECK_ONLY=false
+
+# With --network-check-only: also enable public network access from selected
+# networks on accounts where public access is disabled, then add Lucidity's
+# subnet rule (--enable-public-access-from-selected-networks).
+ENABLE_PUBLIC_ACCESS=false
 
 # Lucidity's service principal in your tenant. Leave empty: the script finds
 # it from Lucidity's application ID, and creates it in your tenant if it isn't
@@ -129,11 +137,16 @@ usage() {
 Usage: lucidity-onboarding.sh [options]
 
 Access scope (where Lucidity gets access):
-  -t, --scope-type TYPE      management-group (default) or subscription
+  -t, --scope-type TYPE      management-group (default), subscription, or
+                             storage-account (only with --network-check-only)
   -s, --scope-ids IDS        Management group IDs, comma-separated.
                              With --scope-type subscription: subscription IDs
                              (optional; without it, every enabled subscription
                              you can access, after you confirm the list).
+                             With --scope-type storage-account: storage
+                             account resource IDs (required), as in
+                             /subscriptions/<id>/resourceGroups/<rg>/providers/
+                             Microsoft.Storage/storageAccounts/<name>
   -x, --exclude-ids IDS      Subscriptions or nested management groups to
                              leave out, comma-separated.
 
@@ -159,6 +172,14 @@ Other options:
                              list, optimization access and storage changes
   --network-check-only       Only check storage account firewalls and add
                              Lucidity's rules. Grants no roles.
+  --enable-public-access-from-selected-networks
+                             With --network-check-only: on accounts with
+                             public network access disabled, enable it from
+                             selected networks (default action Deny), then
+                             add Lucidity's subnet rule. Without this option
+                             you are asked at the prompt; with it, you
+                             consent up front. Rolled back per account if
+                             the rule can't be added.
   --blob-setup WHO           lucidity (default) or script: who creates the
                              lucidity-inventory container, turns on last
                              access time tracking and adds Lucidity's blob
@@ -205,12 +226,13 @@ while [[ $# -gt 0 ]]; do
 
   case "$opt" in
     --help) usage_full; exit 0 ;;
-    --auto-approve|--no-guest-insights|--network-check-only)
+    --auto-approve|--no-guest-insights|--network-check-only|--enable-public-access-from-selected-networks)
       [[ "$has_value" == true ]] && usage_error "$opt doesn't take a value."
       case "$opt" in
         --auto-approve) AUTO_APPROVE=true ;;
         --no-guest-insights) GUEST_INSIGHTS=false; PERMISSION_OPTIONS+=("$opt") ;;
         --network-check-only) NETWORK_CHECK_ONLY=true ;;
+        --enable-public-access-from-selected-networks) ENABLE_PUBLIC_ACCESS=true ;;
       esac
       continue ;;
     --scope-type|--scope-ids|--exclude-ids|--mode|--feature-modules|--blob-setup) ;;
@@ -261,8 +283,8 @@ done
 
 SCOPE_TYPE=$(tr 'A-Z_' 'a-z-' <<< "$SCOPE_TYPE")
 case "$SCOPE_TYPE" in
-  management-group|subscription) ;;
-  *) usage_error "--scope-type must be management-group or subscription. Got: '$SCOPE_TYPE'" ;;
+  management-group|subscription|storage-account) ;;
+  *) usage_error "--scope-type must be management-group, subscription or storage-account. Got: '$SCOPE_TYPE'" ;;
 esac
 
 case "$MODE" in
@@ -275,7 +297,7 @@ case "$BLOB_SETUP" in
   *) usage_error "--blob-setup must be lucidity or script. Got: '$BLOB_SETUP'" ;;
 esac
 
-for setting in AUTO_APPROVE AUTOSCALER IDLE_DISK DISK_TIERING BLOBS \
+for setting in AUTO_APPROVE ENABLE_PUBLIC_ACCESS AUTOSCALER IDLE_DISK DISK_TIERING BLOBS \
     GUEST_INSIGHTS BLOB_VISIBILITY STORAGE_NETWORK_CHECK; do
   case "${!setting}" in
     true|false) ;;
@@ -290,6 +312,24 @@ read -ra EXCLUDE_ID_LIST <<< "$(tr ',' ' ' <<< "$EXCLUDE_IDS")"
 
 if [[ "$NETWORK_CHECK_ONLY" == true && ${#PERMISSION_OPTIONS[@]} -gt 0 ]]; then
   usage_error "--network-check-only grants no roles, so it can't be combined with ${PERMISSION_OPTIONS[0]}."
+fi
+if [[ "$ENABLE_PUBLIC_ACCESS" == true && "$NETWORK_CHECK_ONLY" != true ]]; then
+  usage_error "--enable-public-access-from-selected-networks only works with --network-check-only."
+fi
+# Storage account scope: exact resource IDs, network check only.
+STORAGE_ACCOUNT_IDS=""
+if [[ "$SCOPE_TYPE" == storage-account ]]; then
+  [[ "$NETWORK_CHECK_ONLY" == true ]] ||
+    usage_error "--scope-type storage-account grants no roles, so it only works with --network-check-only."
+  [[ ${#SCOPE_ID_LIST[@]} -gt 0 ]] ||
+    usage_error "--scope-type storage-account needs --scope-ids with storage account resource IDs."
+  [[ ${#EXCLUDE_ID_LIST[@]} -eq 0 ]] ||
+    usage_error "--exclude-ids can't be used with --scope-type storage-account. List only the accounts you want."
+  for id in "${SCOPE_ID_LIST[@]}"; do
+    [[ "$id" =~ ^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/[Mm]icrosoft\.[Ss]torage/storageAccounts/[^/]+$ ]] ||
+      usage_error "not a storage account resource ID: '$id'. Expected /subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<name>"
+  done
+  STORAGE_ACCOUNT_IDS="${SCOPE_ID_LIST[*]}"
 fi
 if [[ "$NETWORK_CHECK_ONLY" == true && "$STORAGE_NETWORK_CHECK" != true ]]; then
   error "--network-check-only needs STORAGE_NETWORK_CHECK=true."
@@ -434,6 +474,7 @@ finish() {
     --argjson allSubscriptions "$ALL_SUBSCRIPTIONS" \
     --argjson autoApprove "$AUTO_APPROVE" \
     --argjson networkCheckOnly "$NETWORK_CHECK_ONLY" \
+    --argjson enablePublicAccess "$ENABLE_PUBLIC_ACCESS" \
     --arg mode "$MODE" \
     --arg reservationsReader "$RESERVATIONS_READER" \
     --argjson guestInsights "$GUEST_INSIGHTS" \
@@ -465,6 +506,7 @@ finish() {
       allSubscriptions: $allSubscriptions,
       mode: (if $networkCheckOnly then "network-check-only" else $mode end),
       autoApprove: $autoApprove,
+      enablePublicAccessFromSelectedNetworks: $enablePublicAccess,
       featureModules: {
         autoscaler: $autoscaler,
         idleDisk: $idleDisk,
@@ -1064,6 +1106,12 @@ elif [[ "$SCOPE_TYPE" == subscription ]]; then
   for id in "${SCOPE_ID_LIST[@]}"; do
     add_target "$id" "$id" "$ALL_SUBS"
   done
+elif [[ "$SCOPE_TYPE" == storage-account ]]; then
+  # The accounts' subscriptions are the targets; only the named accounts are
+  # checked in them.
+  for id in $(printf '%s\n' "${SCOPE_ID_LIST[@]}" | cut -d/ -f3 | sort -fu); do
+    add_target "$id" "$id" "$ALL_SUBS"
+  done
 else
   if ! ENTITIES=$(az account management-group entities list -o json \
       --only-show-errors 2>"$WORK_DIR/err"); then
@@ -1141,7 +1189,7 @@ if [[ "$ALL_SUBSCRIPTIONS" == true && "$SCOPE_TYPE" == management-group ]]; then
 elif [[ "$ALL_SUBSCRIPTIONS" == true ]]; then
   progress "Targets: every subscription you can access in tenant $TENANT_ID"
 else
-  progress "Targets ($SCOPE_TYPE):"
+  progress "Targets ($SCOPE_TYPE$([[ "$SCOPE_TYPE" == storage-account ]] && echo ", shown as their subscriptions")):"
 fi
 jq -r --arg verb "$([[ "$NETWORK_CHECK_ONLY" == true ]] && echo check || echo onboard)" \
   '"   \(.subscriptionId)" + (if .name != "" then " (\(.name))" else "" end)
@@ -1371,8 +1419,12 @@ fi
 # traffic coming from that subnet, and the subnet rule is what allows it.
 # The IP rules of the earlier Regional setup are removed on a rerun.
 # With public network access disabled, only a private endpoint can reach an
-# account, so those are only reported.
-# Only Lucidity's own rules are added or removed; defaultAction and
+# account, so those are only reported, unless the customer consents (with
+# --network-check-only: --enable-public-access-from-selected-networks, or a
+# yes at its prompt). Then public access is enabled with default action Deny
+# in one call and the subnet rule added; if the rule can't be added, the
+# enable is rolled back.
+# Otherwise only Lucidity's own rules are added or removed; defaultAction and
 # publicNetworkAccess are never changed.
 #
 # Blob setup (BLOB_SETUP=script): the lucidity-inventory container, last
@@ -1391,11 +1443,11 @@ BLOB_SETUP_KINDS='["StorageV2","BlobStorage","BlockBlobStorage"]'
 storage_note() {
   case "$1" in
     public_access_disabled)
-      echo "Public network access is disabled, so Lucidity can't reach them. To include them, allow selected networks and rerun." ;;
+      echo "Public network access is disabled, so Lucidity can't reach them. To include them, rerun with --network-check-only --enable-public-access-from-selected-networks, or allow selected networks yourself." ;;
     network_perimeter)
       echo "Secured by a network security perimeter. Add Lucidity to the perimeter's access rules." ;;
     not_found)
-      echo "Not found in the target subscriptions. Check the names in STORAGE_ACCOUNTS." ;;
+      echo "Not found, or your account can't read them. Check the names in STORAGE_ACCOUNTS or the resource IDs in --scope-ids." ;;
     check_failed)
       echo "Couldn't check the container, last access time tracking or inventory policy; see the report." ;;
     policy_disabled)
@@ -1404,6 +1456,10 @@ storage_note() {
       echo "Changes not made. Rerun and approve them at the prompt." ;;
     failed)
       echo "Some changes failed; see the report for the error." ;;
+    failed_rolled_back)
+      echo "Public access was enabled but Lucidity's rule couldn't be added, so public access was set back to Disabled. See the report for the error." ;;
+    failed_rollback_incomplete)
+      echo "ACTION NEEDED: public access was enabled, the rule couldn't be added, and public access couldn't be set back to Disabled. The report has each account's restoreCommand." ;;
   esac
 }
 
@@ -1418,6 +1474,12 @@ apply_storage_action() {
   local value="$6"
 
   case "$type" in
+    public_access)
+      # One call, so the account is never open to all networks: public
+      # access on, default action Deny.
+      az storage account update --subscription "$sub" -g "$rg" -n "$name" \
+        --public-network-access Enabled --default-action Deny \
+        --only-show-errors 2>&1 >/dev/null </dev/null ;;
     ip|subnet)
       local flag="--ip-address"
       [[ "$type" == subnet ]] && flag="--subnet"
@@ -1449,6 +1511,42 @@ apply_storage_action() {
   esac
 }
 
+# Puts an account back as it was before this run enabled public network access:
+# public access Disabled and its original default action, retried because
+# most failures here are transient (an account still updating). Then removes
+# the rules this run added. Prints Azure's error and returns 1 if the account
+# could not be restored.
+# Arguments: subscription, resource group, account, original default action,
+# then the rules this run added as "type value" strings.
+rollback_public_access() {
+  local sub="$1" rg="$2" name="$3" default_action="$4"
+  shift 4
+  local attempt err="" rule type value flag
+  for attempt in 1 2 3; do
+    if err=$(az storage account update --subscription "$sub" -g "$rg" -n "$name" \
+        --public-network-access Disabled --default-action "$default_action" \
+        --only-show-errors 2>&1 >/dev/null </dev/null); then
+      err=""
+      break
+    fi
+    [[ "$attempt" -lt 3 ]] && sleep $((attempt * 5))
+  done
+  if [[ -n "$err" ]]; then
+    echo "$err"
+    return 1
+  fi
+  # Best effort: with public access off, a leftover rule does nothing.
+  for rule in "$@"; do
+    type="${rule%% *}"
+    value="${rule#* }"
+    flag="--ip-address"
+    [[ "$type" == subnet ]] && flag="--subnet"
+    az storage account network-rule remove --subscription "$sub" -g "$rg" \
+      --account-name "$name" "$flag" "$value" --only-show-errors >/dev/null 2>&1 </dev/null || true
+  done
+  return 0
+}
+
 # Prints a storage account's blob inventory policy as JSON, or null if it has
 # none. On any other error, prints Azure's error and returns 1.
 read_inventory_policy() {
@@ -1471,7 +1569,7 @@ check_storage() {
   local checked_file="$WORK_DIR/accounts-checked.jsonl"
   local listed plan pending apply=false sub record name rg
   local op type value err failures attention total lat exists check_err policy
-  local done_count=0 reason count
+  local done_count=0 reason count enable_count enabled added result orig_default rb_err restore
 
   [[ "$BLOB_VISIBILITY" == true && "$BLOB_SETUP" == script &&
      "$NETWORK_CHECK_ONLY" != true ]] && setup=true
@@ -1490,7 +1588,7 @@ check_storage() {
   progress "Listing storage accounts in $(jq -s '[.[] | select(.status == "eligible")] | length' "$TARGETS_FILE") subscription(s)..."
   for sub in $(jq -r 'select(.status == "eligible") | .subscriptionId' "$TARGETS_FILE"); do
     if ! listed=$(az storage account list --subscription "$sub" \
-        --query "[].{name: name, resourceGroup: resourceGroup, location: location, kind: kind,
+        --query "[].{id: id, name: name, resourceGroup: resourceGroup, location: location, kind: kind,
           isHnsEnabled: isHnsEnabled, publicNetworkAccess: publicNetworkAccess,
           defaultAction: networkRuleSet.defaultAction,
           ipRules: networkRuleSet.ipRules[].ipAddressOrRange,
@@ -1500,8 +1598,13 @@ check_storage() {
         "could not list storage accounts: $(tr '\n' ' ' < "$WORK_DIR/storage-list.err")"
       continue
     fi
+    # With storage account IDs, only those accounts; otherwise the name
+    # filter, if any.
     jq -c --arg sub "$sub" --argjson wanted "$(to_json_list "$STORAGE_ACCOUNTS")" \
-      '.[] | select($wanted == [] or (.name as $n | any($wanted[]; . == $n)))
+      --argjson ids "$(to_json_list "$STORAGE_ACCOUNT_IDS")" \
+      '.[] | select(if ($ids | length) > 0
+                    then (.id | ascii_downcase) as $i | any($ids[]; ascii_downcase == $i)
+                    else ($wanted == [] or (.name as $n | any($wanted[]; . == $n))) end)
        | . + {subscriptionId: $sub}' <<< "$listed" >> "$accounts_file"
   done
   : > "$STORAGE_CHECKED_FILE"
@@ -1545,8 +1648,12 @@ check_storage() {
 
   # One entry per account: its firewall status, its blob setup status, and
   # the changes it needs (actions).
-  plan=$(jq -sc \
+  # $1: true to also plan enabling public network access from selected
+  # networks on accounts where it is disabled.
+  build_plan() { jq -sc \
+    --argjson allowEnable "$1" \
     --argjson wanted "$(to_json_list "$STORAGE_ACCOUNTS")" \
+    --argjson wantedIds "$(to_json_list "$STORAGE_ACCOUNT_IDS")" \
     --argjson ips "$(to_json_list "$LUCIDITY_EGRESS_IPS")" \
     --argjson retired "$(to_json_list "$LUCIDITY_RETIRED_EGRESS_IPS")" \
     --argjson subnets "$(to_json_list "$LUCIDITY_SUBNET_IDS")" \
@@ -1575,7 +1682,18 @@ check_storage() {
     def network_part($a; $base):
       if ($network | not) then {status: "not_checked", actions: []}
       elif $a.kind == "FileStorage" then {status: "not_applicable", actions: []}
-      elif $base.publicNetworkAccess == "Disabled" then {status: "public_access_disabled", actions: []}
+      elif $base.publicNetworkAccess == "Disabled" then
+        # Enabling public access from selected networks is only worth doing
+        # where the Lucidity subnet rule applies, and only with consent. The
+        # enable comes first, then the rules; the apply step rolls the enable
+        # back if a rule cannot be added.
+        if subnet_covers($a) and ($subnets | length) > 0 then
+          if $allowEnable then
+            ([{op: "enable", type: "public_access", value: "selected-networks"}]
+             + subnet_adds($a) + ip_adds($a)) as $actions
+            | {status: "public_access_will_enable", actions: $actions, enableEligible: true}
+          else {status: "public_access_disabled", actions: [], enableEligible: true} end
+        else {status: "public_access_disabled", actions: []} end
       elif $base.publicNetworkAccess == "SecuredByPerimeter" then {status: "network_perimeter", actions: []}
       elif $base.defaultAction == "Allow" then {status: "open", actions: []}
       else
@@ -1616,20 +1734,57 @@ check_storage() {
       . as $a
       | {subscriptionId, name, resourceGroup, location, kind,
          publicNetworkAccess: (.publicNetworkAccess // "Enabled"),
-         defaultAction: (.defaultAction // "Allow")} as $base
+         defaultAction: (.defaultAction // "Allow"),
+         ipRuleCount: ((.ipRules // []) | length),
+         vnetRuleCount: ((.vnetRules // []) | length)} as $base
       | network_part($a; $base) as $n
       | setup_part($a) as $s
       | $base + {status: $n.status, setupStatus: $s.setupStatus, actions: ($n.actions + $s.actions),
+                 enableEligible: ($n.enableEligible // false),
                  subnetRuleApplies: (($subnets | length) > 0 and subnet_covers($a)),
                  ipOnly: (($subnets | length) > 0 and ($ips | length) > 0 and (subnet_covers($a) | not))}
         + (if $s.setupDetail then {setupDetail: $s.setupDetail} else {} end);
     . as $all
     | [$all[] | classify]
-      + [$wanted[] | . as $w | select($all | all(.name != $w))
-         | {name: $w, status: "not_found", setupStatus: "not_found", actions: []}]' "$checked_file")
+      + (if ($wantedIds | length) > 0 then
+           [$wantedIds[] | . as $w | select($all | all((.id | ascii_downcase) != ($w | ascii_downcase)))
+            | {name: $w, status: "not_found", setupStatus: "not_found", actions: []}]
+         else
+           [$wanted[] | . as $w | select($all | all(.name != $w))
+            | {name: $w, status: "not_found", setupStatus: "not_found", actions: []}]
+         end)' "$checked_file"; }
+  plan=$(build_plan "$ENABLE_PUBLIC_ACCESS")
 
   total=$(jq length <<< "$plan")
   pending=$(jq '[.[] | select(.actions != [])] | length' <<< "$plan")
+
+  # Network-check-only runs: the accounts that need action or attention, one
+  # per row, so a long list can be filtered instead of read on the console.
+  # Written before any prompt, and again if consent changes the plan.
+  PLAN_FILE="${REPORT_FILE/lucidity-onboarding-report-/lucidity-storage-plan-}"
+  PLAN_FILE="${PLAN_FILE%.json}.csv"
+  write_plan_file() {
+    local rows
+    rows=$(jq '[.[] | select(.status | IN("needs_rule", "public_access_will_enable",
+        "public_access_disabled", "network_perimeter", "not_found"))] | length' <<< "$plan")
+    if [[ "$rows" -eq 0 ]]; then
+      rm -f "$PLAN_FILE"
+      return 0
+    fi
+    jq -r '
+      def action_text: if .type == "public_access"
+        then "enable public access from selected networks (default action Deny)"
+        else "\(.op) \(.type) rule \(.value | split("/") | last)" end;
+      ["subscription", "resource_group", "account", "region", "status", "planned_actions",
+       "public_network_access", "default_action", "ip_rules", "vnet_rules"],
+      (.[] | select(.status | IN("needs_rule", "public_access_will_enable",
+          "public_access_disabled", "network_perimeter", "not_found"))
+       | [.subscriptionId, .resourceGroup, .name, .location, .status,
+          ([.actions[] | action_text] | join("; ")),
+          .publicNetworkAccess, .defaultAction, .ipRuleCount, .vnetRuleCount])
+      | @csv' <<< "$plan" > "$PLAN_FILE" 2>/dev/null || PLAN_FILE=""
+  }
+  [[ "$NETWORK_CHECK_ONLY" == true ]] && write_plan_file
 
   # Counts only: per-account details are in the report.
   echo ""
@@ -1637,7 +1792,7 @@ check_storage() {
   if [[ "$network" == true ]]; then
     jq -r '
       def count(f): [.[] | select(f)] | length;
-      def rules(t): count(any(.actions[]; .type == t and .op == "add"));
+      def rules(t): count(.status == "needs_rule" and any(.actions[]; .type == t and .op == "add"));
       "   Firewall:",
       "   - nothing needed: \(count(.status | IN("open", "already_allowed", "not_applicable")))"
         + " (open to all networks, already allowing Lucidity, or file shares only)",
@@ -1650,6 +1805,9 @@ check_storage() {
                          (removals("subnet") | select(. > 0) | "old Lucidity subnet removed: \(.)")]
                         | join(", ")) + ")"
            else "" end),
+      (if count(.status == "public_access_will_enable") > 0 then
+        "   - public access disabled, to be enabled from selected networks, then Lucidity'"'"'s subnet rule added: \(count(.status == "public_access_will_enable"))"
+       else empty end),
       (if count(.status | IN("public_access_disabled", "network_perimeter")) > 0 then
         "   - need manual action: \(count(.status | IN("public_access_disabled", "network_perimeter")))"
         + " (" + ([(count(.status == "public_access_disabled") | select(. > 0)
@@ -1682,7 +1840,40 @@ check_storage() {
         "   - couldn'"'"'t check: \(count(.setupStatus == "check_failed"))" else empty end)' \
       --arg c "$INVENTORY_CONTAINER" <<< "$plan"
   fi
+  if [[ "$NETWORK_CHECK_ONLY" == true && -n "$PLAN_FILE" && -f "$PLAN_FILE" ]]; then
+    echo "   Accounts that need action, one per row: $PLAN_FILE"
+    echo "   (filter the status column: needs_rule, public_access_will_enable,"
+    echo "   public_access_disabled, network_perimeter, not_found)"
+  fi
   echo "   Each account's details are in the report."
+
+  # Public access disabled: consent is the flag, or a yes to its own prompt.
+  # --auto-approve does not answer it. A no, or no terminal, leaves those
+  # accounts untouched.
+  if [[ "$NETWORK_CHECK_ONLY" == true && "$ENABLE_PUBLIC_ACCESS" != true ]]; then
+    count=$(jq '[.[] | select(.status == "public_access_disabled" and .enableEligible)] | length' <<< "$plan")
+    if [[ "$count" -gt 0 ]]; then
+      if has_terminal; then
+        echo ""
+        echo "${BOLD}$count storage account(s) have public network access disabled, so Lucidity can't reach them.${RESET}"
+        echo "   To include them, for each of these accounts the script will:"
+        echo "   1. Enable public network access from selected networks"
+        echo "      (public access Enabled, default action Deny)"
+        echo "   2. Add Lucidity's subnet rule"
+        echo "   If step 2 fails, step 1 is rolled back for that account."
+        echo "   Any IP or VNet rules the account already has become active again."
+        [[ -f "$PLAN_FILE" ]] && echo "   Review them first: filter status = public_access_disabled in $PLAN_FILE"
+        if ask_yes "Enable public access from selected networks and add Lucidity's rule on these $count account(s)?"; then
+          plan=$(build_plan true)
+          pending=$(jq '[.[] | select(.actions != [])] | length' <<< "$plan")
+          write_plan_file
+        fi
+      else
+        echo "   $count account(s) have public network access disabled and were not changed (no terminal to ask)."
+        echo "   To include them, add --enable-public-access-from-selected-networks."
+      fi
+    fi
+  fi
 
   # Unlike the approvals above, a no here doesn't stop the run: the roles
   # are already in place.
@@ -1691,7 +1882,8 @@ check_storage() {
       apply=true
       echo "   Auto-approved (--auto-approve)."
     elif has_terminal; then
-      ask_yes "Apply these changes on $pending storage account(s)?" && apply=true
+      enable_count=$(jq '[.[] | select(.status == "public_access_will_enable")] | length' <<< "$plan")
+      ask_yes "Apply these changes on $pending storage account(s)$([[ "$enable_count" -gt 0 ]] && echo ", including enabling public access on $enable_count")?" && apply=true
     else
       echo "   No terminal to ask for approval, so nothing was changed."
       echo "   Rerun in a terminal, or add --auto-approve."
@@ -1715,35 +1907,72 @@ check_storage() {
     done_count=$((done_count + 1))
     [[ -t 2 ]] && printf '\r   Updating storage account %d of %d...' "$done_count" "$pending" >&2
     failures=""
-    # Removing an old rule after a new one failed could cut Lucidity off, so
-    # removals are skipped then.
+    enabled=false
+    added=()
+    result=""
+    # Enabling public access and adding the rule are one unit: if the enable
+    # worked and a rule can't be added, the enable is rolled back and the
+    # remaining changes for the account are not made. If the enable itself
+    # fails, nothing has changed and there is nothing to roll back.
+    # Otherwise, removing an old rule after a new one failed could cut
+    # Lucidity off, so removals are skipped then.
     while IFS=$'\t' read -r op type value; do
       if [[ "$op" == remove && -n "$failures" ]]; then
         failures="${failures}${op} ${type} ${value}: skipped, because an earlier change failed; "
         continue
       fi
-      if ! err=$(apply_storage_action "$sub" "$rg" "$name" "$op" "$type" "$value"); then
-        failures="${failures}${op} ${type} ${value}: ${err}; "
+      if err=$(apply_storage_action "$sub" "$rg" "$name" "$op" "$type" "$value"); then
+        [[ "$type" == public_access ]] && enabled=true
+        [[ "$op" == add && "$type" =~ ^(ip|subnet)$ ]] && added+=("$type $value")
+        continue
+      fi
+      failures="${failures}${op} ${type} ${value}: ${err}; "
+      if [[ "$type" == public_access ]]; then
+        result="failed"
+        break
+      fi
+      if [[ "$enabled" == true ]]; then
+        orig_default=$(jq -r '.defaultAction // "Allow"' <<< "$record")
+        if rb_err=$(rollback_public_access "$sub" "$rg" "$name" "$orig_default" \
+            ${added[@]+"${added[@]}"}); then
+          result="failed_rolled_back"
+          failures="${failures}public access was set back to Disabled (default action ${orig_default}); "
+        else
+          result="failed_rollback_incomplete"
+          failures="${failures}COULD NOT SET PUBLIC ACCESS BACK: ${rb_err}; "
+        fi
+        break
       fi
     done < <(jq -r '.actions[] | [.op, .type, .value] | @tsv' <<< "$record")
 
+    # To undo what this run did, whatever the result.
+    restore=""
+    if [[ "$enabled" == true && "$result" != failed_rolled_back ]]; then
+      restore="az storage account update --subscription $sub -g $rg -n $name --public-network-access Disabled --default-action $(jq -r '.defaultAction // "Allow"' <<< "$record")"
+    fi
+
     if [[ -z "$failures" ]]; then
-      jq -c '.result = "applied"' <<< "$record" >> "$STORAGE_FILE"
+      jq -c --arg restore "$restore" '.result = "applied"
+        | if $restore != "" then .restoreCommand = $restore else . end' \
+        <<< "$record" >> "$STORAGE_FILE"
     else
-      jq -c --arg detail "$failures" '.result = "failed" | .detail = $detail' \
+      jq -c --arg detail "$failures" --arg restore "$restore" \
+        --arg result "${result:-failed}" \
+        '.result = $result | .detail = $detail
+         | if $restore != "" then .restoreCommand = $restore else . end' \
         <<< "$record" >> "$STORAGE_FILE"
     fi
   done < <(jq -c '.[]' <<< "$plan")
   if [[ "$apply" == true ]]; then
     [[ -t 2 ]] && echo "" >&2
     echo "   Applied on $(jq -s '[.[] | select(.result == "applied")] | length' "$STORAGE_FILE")," \
-      "failed on $(jq -s '[.[] | select(.result == "failed")] | length' "$STORAGE_FILE")."
+      "failed on $(jq -s '[.[] | select((.result // "") | startswith("failed"))] | length' "$STORAGE_FILE")."
   fi
 
   attention=$(jq -sc '[.[] | select(
       (.status | IN("public_access_disabled", "network_perimeter", "not_found"))
       or (.setupStatus | IN("check_failed", "policy_disabled"))
-      or (.result | IN("pending_approval", "failed")))]' "$STORAGE_FILE")
+      or (.result | IN("pending_approval", "failed", "failed_rolled_back", "failed_rollback_incomplete")))]' "$STORAGE_FILE")
 
   if [[ "$(jq length <<< "$attention")" -eq 0 ]]; then
     record_step "Storage check" "ok" false \
@@ -1760,7 +1989,7 @@ check_storage() {
     echo "   - $count: $(storage_note "$reason")"
   done < <(jq -r '[.[] | (.status | select(IN("public_access_disabled", "network_perimeter", "not_found"))),
       (.setupStatus | select(IN("check_failed", "policy_disabled"))),
-      (.result | select(IN("pending_approval", "failed")))]
+      (.result | select(IN("pending_approval", "failed", "failed_rolled_back", "failed_rollback_incomplete")))]
     | group_by(.) | .[] | [length, .[0]] | @tsv' <<< "$attention")
   printf '%s' "$RESET"
 }

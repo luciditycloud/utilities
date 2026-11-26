@@ -65,8 +65,8 @@ Each option has a short form, and takes its value either way:
 
 | Option | Default | What it does |
 |---|---|---|
-| `-t`, `--scope-type` | `management-group` | `management-group` or `subscription` |
-| `-s`, `--scope-ids` | everything you can access | **Management groups:** these management group IDs. Without it, the top management groups you can access (the tenant root group, if you can access it), after you confirm the list. **Subscriptions:** these subscription IDs. Without it, every enabled subscription you can access, after you confirm the list |
+| `-t`, `--scope-type` | `management-group` | `management-group`, `subscription`, or `storage-account` (only with `--network-check-only`) |
+| `-s`, `--scope-ids` | everything you can access | **Management groups:** these management group IDs. Without it, the top management groups you can access (the tenant root group, if you can access it), after you confirm the list. **Subscriptions:** these subscription IDs. Without it, every enabled subscription you can access, after you confirm the list. **Storage accounts:** the resource IDs of the accounts to check, required (see [Checking specific storage accounts](#checking-specific-storage-accounts)) |
 | `-x`, `--exclude-ids` | none | Subscriptions to leave out, or nested management groups, which leaves out every subscription under them |
 
 IDs are comma-separated, for example `--exclude-ids="<id-1>,<id-2>"`.
@@ -93,6 +93,7 @@ See [What it grants](#what-it-grants) for the details.
 |---|---|
 | `-y`, `--auto-approve` | Answer yes to every prompt, for runs without a terminal |
 | `--network-check-only` | Only check storage account firewalls and add Lucidity's rules, for when Lucidity's roles are already in place. Grants no roles. Can't be combined with `--mode`, `--feature-modules`, `--blob-setup` or `--no-guest-insights` |
+| `--enable-public-access-from-selected-networks` | Only with `--network-check-only`. On storage accounts where public network access is disabled, enables it from selected networks, then adds Lucidity's rule. Passing it is your consent, so there is no prompt for these accounts. See [Accounts with public access disabled](#accounts-with-public-access-disabled) |
 | `--blob-setup script` | The script sets up blob inventory on your storage accounts with your credentials: the `lucidity-inventory` container, last access time tracking and Lucidity's inventory rule, added to any inventory policy the account already has. Lucidity's role then gets no write permissions for them. Storage accounts created later need a rerun |
 | `--no-guest-insights` | Don't grant VM Run Command |
 | `-h`, `--help` | Show all options |
@@ -167,7 +168,7 @@ account needs depends on its public network access setting:
 |---|---|
 | Enabled from all networks | Nothing |
 | Enabled from selected networks | A firewall rule for Lucidity's subnet, in every region |
-| Disabled | Lucidity can't reach the account: only a private endpoint could, and Lucidity doesn't offer one. Out of scope unless you allow selected networks |
+| Disabled | Lucidity can't reach the account: only a private endpoint could, and Lucidity doesn't offer one. Out of scope unless you allow selected networks, which `--network-check-only --enable-public-access-from-selected-networks` can do for you |
 
 Lucidity's traffic arrives through its subnet's service endpoint, which
 reaches storage accounts in every region, so the subnet rule is all it
@@ -186,15 +187,83 @@ Run with `--network-check-only`.
 | `open` | Firewall allows all networks | Nothing needed |
 | `already_allowed` | Lucidity's rules are already in place | Nothing needed |
 | `needs_rule` | Firewall allows selected networks and Lucidity's rule is missing, or an old Lucidity rule is still there | The subnet rule is added and old Lucidity rules removed, after your approval |
-| `public_access_disabled` | Public network access is disabled | Out of scope: Lucidity can't reach it. To include it, allow selected networks and rerun |
+| `public_access_will_enable` | Public network access is disabled and you consented to enabling it | Public access is enabled from selected networks, then the subnet rule is added; rolled back if the rule can't be added |
+| `public_access_disabled` | Public network access is disabled, and not enabled by this run | Out of scope: Lucidity can't reach it. To include it, allow selected networks and rerun, or see [Accounts with public access disabled](#accounts-with-public-access-disabled) |
 | `network_perimeter` | Secured by a network security perimeter | Manual: add Lucidity to the perimeter's access rules |
 | `not_applicable` | File-share-only account | Nothing needed |
 
-**What it changes:** only Lucidity's own firewall rules: its subnet rule is
+**What it changes:** Lucidity's own firewall rules: its subnet rule is
 added, and old Lucidity rules removed. An old rule is removed only after the
-new one is in place. It never changes an
-account's default action or public network access, and never touches your
-own rules. Changes are made with your credentials.
+new one is in place. It never touches your own rules. Unless you ask it to
+enable public access (below), it never changes an account's default action or
+public network access. Changes are made with your credentials.
+
+### Accounts with public access disabled
+
+With `--network-check-only` only, the script can enable public network access
+from selected networks on accounts where it is disabled, so Lucidity can reach
+them. Because that changes a security setting you chose, it needs your
+consent, separate from the usual approval:
+
+- **`--enable-public-access-from-selected-networks`** is that consent, given
+  up front.
+- **Without it, in a terminal,** the script asks, naming both changes, and
+  tells you where the list of accounts is.
+- **Without it and without a terminal,** these accounts are left unchanged.
+- **`--auto-approve` doesn't answer this question.**
+
+For each such account, as one unit:
+
+1. Public network access is set to **Enabled**, with default action **Deny**,
+   in a single call, so the account is never open to all networks.
+2. Lucidity's subnet rule is added.
+
+If step 2 fails, step 1 is rolled back: public access goes back to
+**Disabled** with the account's original default action (retried up to three
+times), and any rule added in this run is removed. The account is reported as
+`failed_rolled_back`. If step 1 itself fails, nothing has changed. If the
+rollback also fails, the account is reported as `failed_rollback_incomplete`
+and the console says to act: the report has each account's `restoreCommand`.
+
+Things to know:
+
+- **Existing rules become active.** Any IP or VNet rules the account already
+  had apply again once public access is on, so review them first. The plan file
+  and report list how many each account has.
+- **Only where the subnet rule applies.** Accounts Lucidity's subnet can't
+  serve are left alone.
+- **Not for** file-share-only accounts or accounts secured by a network
+  security perimeter.
+- **Undoing it.** Every account that was enabled has a `restoreCommand` in the
+  report that sets public access back to Disabled with its original default
+  action.
+
+### The plan file
+
+In `--network-check-only` runs the script also writes
+`lucidity-storage-plan-<timestamp>.csv` next to the report, before it asks
+anything: one row per account that needs action or attention, with its
+status, planned actions, current public access and default action, and
+existing IP and VNet rule counts. The console shows counts only, so with many
+accounts, filter the `status` column (`needs_rule`,
+`public_access_will_enable`, `public_access_disabled`, `network_perimeter`,
+`not_found`).
+
+### Checking specific storage accounts
+
+`--scope-type storage-account` limits `--network-check-only` to the accounts
+you name, by resource ID. It needs `--network-check-only`, grants no roles, and
+can't be combined with `--exclude-ids`.
+
+```bash
+bash lucidity-onboarding.sh --network-check-only \
+  --scope-type storage-account \
+  --scope-ids="/subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<name>" \
+  --enable-public-access-from-selected-networks
+```
+
+IDs that can't be found, or that your account can't read, are reported as
+`not_found`.
 
 Storage account problems never fail the onboarding: the roles are already in
 place by then. The run finishes as `completed_with_warnings` instead.
@@ -227,7 +296,7 @@ Every run that gets past the initial checks ends with a summary and writes
 - every subscription found: onboarded, failed, skipped or excluded (and
   why),
 - each step's result, with Azure's error message if it failed,
-- each storage account's firewall status and what was changed,
+- each storage account's firewall status, what was changed, and, where public access was enabled, the command that undoes it,
 - the overall status:
   - `completed`: everything worked
   - `completed_with_warnings`: onboarded, with something to look at
